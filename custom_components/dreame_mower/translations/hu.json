@@ -104,6 +104,12 @@
       "bluetooth_connection": {
         "name": "Bluetooth"
       },
+      "wifi_signal": {
+        "name": "Wi-Fi jel"
+      },
+      "cellular_signal": {
+        "name": "Mobiljel"
+      },
       "dnd_status": {
         "name": "Ne zavarjon"
       },

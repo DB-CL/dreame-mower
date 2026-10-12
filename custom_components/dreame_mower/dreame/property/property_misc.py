@@ -16,6 +16,7 @@ from ..const import PROPERTY_1_1, SETTINGS_CHANGE_PROPERTY
 _MAIN_STATE_MOWING = 4
 PROPERTY_1_1_TASK_STATUS_NAME = "property_1_1_task_status"
 PROPERTY_1_1_ACTIVE_CODES_NAME = "property_1_1_active_codes"
+PROPERTY_1_1_SIGNAL_NAME = "property_1_1_signal"
 SETTINGS_CHANGED_PROPERTY_NAME = "device_settings_changed"
 
 # The heartbeat carries the codes the device currently reports as a bitmask in
@@ -69,6 +70,24 @@ _LINK_MODULE_RSSI_INDEX = 18
 _LINK_MODULE_ABSENT_RSSI = 127
 _LINK_MODULE_VALID_PLAN_RSSI = 128
 
+# Frame delimiter at both ends of the heartbeat payload.
+_HEARTBEAT_SENTINEL = 0xCE
+
+# Byte 17 is the Wi-Fi link's signal strength as a signed byte: a negative value
+# is the RSSI in dBm, and zero means the mower is not on Wi-Fi.
+_WIFI_RSSI_INDEX = 17
+
+# The 22-byte heartbeat (dreame.mower.g2541e, A3 AWD Pro) frames the payload with
+# the sentinel at 0 and 21 and carries the signal bytes at the same offsets.
+_HEARTBEAT_LENGTHS_WITH_SIGNAL = (20, 22)
+
+
+def _signal_dbm(raw: int | None) -> int | None:
+    """Return a signal byte as dBm, or None when it carries no reading."""
+    if raw is None or raw < 128:
+        return None
+    return raw - 256
+
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -87,6 +106,7 @@ class Property11Handler:
         self._task_status: str | None = None
         self._active_codes: frozenset[int] | None = None
         self._link_module_rssi: int | None = None
+        self._wifi_rssi: int | None = None
 
     def parse_value(self, value: list[int], notify_callback: Callable[[str, Any], None] | None = None) -> bool:
         """Parse and log property 1:1 value."""
@@ -108,13 +128,14 @@ class Property11Handler:
                 )
                 self._update_task_status(main_state, sub_state, notify_callback)
                 self._update_active_codes(value, notify_callback)
-                self._link_module_rssi = value[_LINK_MODULE_RSSI_INDEX]
+                self.update_signal(value, notify_callback)
             elif len(value) == 24:
                 # 24-byte variant seen on mova.mower.g2405c firmware 4.3.6_0062 (issue #18)
                 _LOGGER.debug("Property 1:1 received (24-byte variant): %s", value)
             elif len(value) == 22:
                 # 22-byte variant seen on dreame.mower.a3-awd-pro (issue #178)
                 _LOGGER.debug("Property 1:1 received (22-byte variant): %s", value)
+                self.update_signal(value, notify_callback)
             elif len(value) == 20:
                 # 20-byte variant with non-CE sentinels seen on dreame.swbot.g2509 fw 4.3.6_0603
                 _LOGGER.debug("Property 1:1 received (20-byte alt-sentinel variant): %s", value)
@@ -144,6 +165,32 @@ class Property11Handler:
             self._task_status = status
             if notify_callback is not None:
                 notify_callback(PROPERTY_1_1_TASK_STATUS_NAME, status)
+
+    def update_signal(
+        self,
+        value: Any,
+        notify_callback: Callable[[str, Any], None] | None,
+    ) -> bool:
+        """Update the link signal bytes from a heartbeat, notifying on change.
+
+        Also fed by the cloud connectivity poll, so the readings refresh even
+        when the mower pushes no heartbeat over MQTT.
+        """
+        if (
+            not isinstance(value, list)
+            or len(value) not in _HEARTBEAT_LENGTHS_WITH_SIGNAL
+            or value[0] != _HEARTBEAT_SENTINEL
+            or value[-1] != _HEARTBEAT_SENTINEL
+        ):
+            return False
+
+        before = (self.wifi_signal_dbm, self.cellular_signal_dbm)
+        self._wifi_rssi = int(value[_WIFI_RSSI_INDEX])
+        self._link_module_rssi = int(value[_LINK_MODULE_RSSI_INDEX])
+        after = (self.wifi_signal_dbm, self.cellular_signal_dbm)
+        if after != before and notify_callback is not None:
+            notify_callback(PROPERTY_1_1_SIGNAL_NAME, after)
+        return True
 
     @staticmethod
     def _decode_active_codes(value: list[int]) -> frozenset[int]:
@@ -208,6 +255,16 @@ class Property11Handler:
         if self._link_module_rssi is None:
             return None
         return self._link_module_rssi >= _LINK_MODULE_VALID_PLAN_RSSI
+
+    @property
+    def wifi_signal_dbm(self) -> int | None:
+        """Return the Wi-Fi signal in dBm (None off Wi-Fi or until a heartbeat is seen)."""
+        return _signal_dbm(self._wifi_rssi)
+
+    @property
+    def cellular_signal_dbm(self) -> int | None:
+        """Return the cellular signal in dBm (None without a module on a valid plan)."""
+        return _signal_dbm(self._link_module_rssi)
 
     @property
     def last_value(self) -> list[int] | None:
@@ -295,6 +352,20 @@ class MiscPropertyHandler:
     def link_module_plan_valid(self) -> bool | None:
         """Return whether the cellular module's data plan is still valid."""
         return self._property_1_1_handler.link_module_plan_valid
+
+    @property
+    def wifi_signal_dbm(self) -> int | None:
+        """Return the Wi-Fi signal in dBm reported by the heartbeat."""
+        return self._property_1_1_handler.wifi_signal_dbm
+
+    @property
+    def cellular_signal_dbm(self) -> int | None:
+        """Return the cellular signal in dBm reported by the heartbeat."""
+        return self._property_1_1_handler.cellular_signal_dbm
+
+    def update_signal(self, value: Any, notify_callback: Callable[[str, Any], None]) -> bool:
+        """Update the link signal readings from a polled heartbeat."""
+        return self._property_1_1_handler.update_signal(value, notify_callback)
 
     def handle_property_update(self, siid: int, piid: int, value: Any, notify_callback: Callable[[str, Any], None]) -> bool:
         """Handle miscellaneous property updates."""

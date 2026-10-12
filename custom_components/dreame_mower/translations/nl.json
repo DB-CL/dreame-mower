@@ -104,6 +104,12 @@
       "bluetooth_connection": {
         "name": "Bluetooth"
       },
+      "wifi_signal": {
+        "name": "Wifi-signaal"
+      },
+      "cellular_signal": {
+        "name": "Mobiel signaal"
+      },
       "dnd_status": {
         "name": "Niet storen"
       },
