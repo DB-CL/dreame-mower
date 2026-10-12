@@ -424,7 +424,6 @@ def generate_svg_map_image(data: Dict[str, Any], historical_file_path: str | Non
                 svg_lines.append(f'<g transform="rotate({rotation}, {center_x}, {center_y})">')
 
             # 0. Draw inter-zone connection paths (type=1) as dashed grey — behind zone fills
-            multi_zone = len(zone_data) > 1
             for i, (z_segs, _z_tracks, _z_name, z_type) in enumerate(zone_data):
                 if z_type != 1:
                     continue
@@ -434,11 +433,15 @@ def generate_svg_map_image(data: Dict[str, Any], historical_file_path: str | Non
                         if dashed:
                             svg_lines.append(dashed)
 
-            # 1. Draw zone fills — only for type=0 (actual mowing zones)
+            # 1. Draw zone fills — only for type=0 (actual mowing zones). Every
+            #    mowing zone is filled, a map's only zone included, each in the
+            #    next colour; the inter-zone paths take no colour of their own.
+            mowing_zones = [i for i, (_s, _t, _n, z_type) in enumerate(zone_data) if z_type == 0]
+            zone_colors = {i: ZONE_COLORS[n % len(ZONE_COLORS)] for n, i in enumerate(mowing_zones)}
             for i, (z_segs, _z_tracks, _z_name, z_type) in enumerate(zone_data):
-                if not z_segs or not multi_zone or z_type != 0:
+                if not z_segs or z_type != 0:
                     continue
-                fill_color, outline_color = ZONE_COLORS[i % len(ZONE_COLORS)]
+                fill_color, outline_color = zone_colors[i]
                 for seg in z_segs:
                     if len(seg) >= 3:
                         poly = svg_polygon(seg, bounds, width, height,
@@ -449,7 +452,7 @@ def generate_svg_map_image(data: Dict[str, Any], historical_file_path: str | Non
             # 2. Draw zone boundary outlines (skip type=1 inter-zone paths)
             for i, (z_segs, _z_tracks, _z_name, z_type) in enumerate(zone_data):
                 if z_segs and z_type == 0:
-                    color = ZONE_COLORS[i % len(ZONE_COLORS)][1] if multi_zone else COLORS_SVG['map_boundary']
+                    color = zone_colors[i][1]
                     boundary_path = svg_path_from_segments(z_segs, bounds, width, height, color, 2, padding=padding)
                     if boundary_path:
                         svg_lines.append(boundary_path)
@@ -547,10 +550,7 @@ def generate_svg_map_image(data: Dict[str, Any], historical_file_path: str | Non
             legend_y = 50
             legend_items = []
 
-            has_segments = any(z_segs for z_segs, _, _, _ in zone_data)
             has_tracks = any(z_tracks for _, z_tracks, _, _ in zone_data)
-            if has_segments and not multi_zone:
-                legend_items.append(("Map Boundary", COLORS_SVG['map_boundary']))
             if has_tracks and not live_coordinates:
                 legend_items.append(("Mowing Path", COLORS_SVG['mowing_path']))
             if obstacles:
