@@ -817,6 +817,11 @@ class DreameMowerDevice:
         The hash of every map comes out of a single read each, and the maps are
         only read back once one of the hashes, or the set of maps, moved.
 
+        The mower does not announce a switch of the active map either, and a
+        switch made in the app leaves every hash as it was. The slot read that
+        carries the hashes also flags the active map, so that flag is applied
+        even when nothing has to be read back.
+
         Returns:
             True if map data was read back and updated, False otherwise.
         """
@@ -833,6 +838,10 @@ class DreameMowerDevice:
         if self._map_hashes is not None and {
             slot["index"]: slot["hash"] for slot in slots
         } == self._map_hashes:
+            for slot in slots:
+                if slot["current"]:
+                    self._apply_current_map_id(self._map_id_from_index(slot["index"]))
+                    break
             return False
 
         return self.fetch_vector_map()
@@ -909,7 +918,7 @@ class DreameMowerDevice:
             return None
 
     def _read_map_slots(self) -> list[dict[str, Any]] | None:
-        """Read the map slots that hold a map, with the hash of each.
+        """Read the map slots that hold a map, with the hash of each and whether it is the active one.
 
         Returns None when the mower does not report its map slots.
         """
@@ -941,7 +950,7 @@ class DreameMowerDevice:
             if info is None:
                 return None
 
-            slots.append({"index": map_index, "hash": info[0]})
+            slots.append({"index": map_index, "hash": info[0], "current": bool(row[1])})
 
         return slots
 
@@ -3256,12 +3265,19 @@ class DreameMowerDevice:
             _LOGGER.debug("MAPL response did not expose a current map: %s", result)
             return False
 
-        if self._current_map_id != current_map_id:
-            self._current_map_id = current_map_id
-            self._reset_cutting_height_cache()
-            self._notify_property_change(CURRENT_MAP_ID_PROPERTY_NAME, current_map_id)
-
+        self._apply_current_map_id(current_map_id)
         return True
+
+    def _apply_current_map_id(self, current_map_id: int | None) -> None:
+        """Take on the active map the mower reports, announcing it when it changed."""
+        if current_map_id is None or self._current_map_id == current_map_id:
+            return
+
+        if self._current_map_id is not None:
+            _LOGGER.info("Active map changed from map ID %s to %s", self._current_map_id, current_map_id)
+        self._current_map_id = current_map_id
+        self._reset_cutting_height_cache()
+        self._notify_property_change(CURRENT_MAP_ID_PROPERTY_NAME, current_map_id)
 
     def _build_get_mowing_preference_payload(
         self,

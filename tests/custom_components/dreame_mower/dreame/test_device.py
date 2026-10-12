@@ -1239,6 +1239,48 @@ def test_refresh_changed_vector_map_reads_nothing_back_while_no_hash_moved(devic
     assert set(reads) == {"MAPL", "MAPI"}
 
 
+def test_refresh_changed_vector_map_follows_a_map_switch_made_in_the_app(device):
+    """A switch of the active map leaves every hash as it was, yet the poll picks it up."""
+    fixture = _device_map_fixture()
+    documents = _fixture_documents(fixture)
+    _connect_with_stored_maps(device, fixture["cache"])
+    device._cloud_device.action_result, _ = _map_responder(fixture["map_list"], documents)
+    assert device.fetch_vector_map() is True
+    first_map_id = device.current_map_id
+    second_map_id = next(m["id"] for m in device.available_maps if m["index"] == 1)
+    assert first_map_id != second_map_id
+
+    property_changes = []
+    device.register_property_callback(lambda name, value: property_changes.append((name, value)))
+    device._cutting_height = 5.0
+    switched_list = [[0, 0, 1, 1, 0], [1, 1, 1, 1, 0]]
+    device._cloud_device.action_result, reads = _map_responder(switched_list, documents)
+
+    assert device.refresh_changed_vector_map() is False
+
+    assert device.current_map_id == second_map_id
+    assert ("current_map_id", second_map_id) in property_changes
+    assert device.cutting_height is None
+    assert "MAPD" not in reads
+
+
+def test_refresh_changed_vector_map_announces_nothing_while_the_active_map_stays(device):
+    """An unchanged active map is not announced again on every poll."""
+    fixture = _device_map_fixture()
+    documents = _fixture_documents(fixture)
+    _connect_with_stored_maps(device, fixture["cache"])
+    device._cloud_device.action_result, _ = _map_responder(fixture["map_list"], documents)
+    assert device.fetch_vector_map() is True
+
+    property_changes = []
+    device.register_property_callback(lambda name, value: property_changes.append((name, value)))
+    device._cloud_device.action_result, _ = _map_responder(fixture["map_list"], documents)
+
+    assert device.refresh_changed_vector_map() is False
+
+    assert [change for change in property_changes if change[0] == "current_map_id"] == []
+
+
 def test_refresh_changed_vector_map_reads_the_maps_back_once_a_map_was_deleted(device):
     """A deleted map changes the set of map slots, which reads the maps back."""
     fixture = _device_map_fixture()
