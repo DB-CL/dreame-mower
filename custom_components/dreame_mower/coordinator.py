@@ -41,6 +41,7 @@ from .dreame.property import (
 from .dreame.const import (
     CURRENT_MAP_ID_PROPERTY_NAME,
     MAP_SWITCH_ANNOUNCED_PROPERTY_NAME,
+    SERVICE1_PROPERTY_50,
     EDGE_BLADE_OFFSET_KEY,
     EDGE_MOWING_AUTO_KEY,
     EDGE_MOWING_SAFE_KEY,
@@ -1112,9 +1113,11 @@ class DreameMowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # The mowing settings are stored per map, so they have to be re-read
             # whenever the active map changes.
             self.hass.create_task(self._async_refresh_preferences_on_map_change())
-        if property_name == MAP_SWITCH_ANNOUNCED_PROPERTY_NAME:
-            # The echo of a switch does not say which map is now active, so the
-            # map list is read back for it.
+        if property_name in (MAP_SWITCH_ANNOUNCED_PROPERTY_NAME, SERVICE1_PROPERTY_50.name):
+            # Neither the echo of a switch nor the session marker (1:50) that
+            # comes with it says which map is now active, so the map list is
+            # read back for it. The echo does not always arrive; the marker
+            # was seen on every switch made in the app.
             self.hass.create_task(self._async_refresh_current_map_on_switch())
         self._normalize_selection_state()
 

@@ -162,6 +162,20 @@ async def test_coordinator_rereads_the_active_map_when_the_mower_announces_a_swi
     assert coordinator.device.refresh_current_map_id.call_count == 2
 
 
+async def test_coordinator_rereads_the_active_map_on_the_session_marker(
+    hass: HomeAssistant, minimal_config_entry
+):
+    """The 1:50 marker that comes with a switch also has the map list read."""
+    coordinator = DreameMowerCoordinator(hass, entry=minimal_config_entry)
+    coordinator.device.refresh_current_map_id = MagicMock(return_value=True)
+
+    with patch("custom_components.dreame_mower.coordinator._MAP_SWITCH_READ_BACK_DELAYS_SECONDS", (0,)):
+        coordinator._handle_device_update("service1_property_50", True)
+        await hass.async_block_till_done()
+
+    coordinator.device.refresh_current_map_id.assert_called_once()
+
+
 async def test_coordinator_refreshes_the_mowing_preferences_of_fixed_height_models(
     hass: HomeAssistant, minimal_config_entry
 ):
