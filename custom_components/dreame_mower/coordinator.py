@@ -40,6 +40,7 @@ from .dreame.property import (
 )
 from .dreame.const import (
     CURRENT_MAP_ID_PROPERTY_NAME,
+    MAP_SWITCH_ANNOUNCED_PROPERTY_NAME,
     EDGE_BLADE_OFFSET_KEY,
     EDGE_MOWING_AUTO_KEY,
     EDGE_MOWING_SAFE_KEY,
@@ -65,6 +66,9 @@ from .dreame.property.property_misc import (
 # a re-read. The device announces every change, including the ones it was just
 # told to make, and a write already knows what it wrote.
 _SETTINGS_WRITE_ECHO_SECONDS = 5.0
+# The mower echoes a map switch on 2:50 as it applies it; the map list is read
+# back a moment later so that it already reports the new map.
+_MAP_SWITCH_READ_BACK_DELAY_SECONDS = 2.0
 
 # The two records the device announces changes to, each with its own echo window
 # so a write to one does not suppress a re-read of the other.
@@ -1098,6 +1102,10 @@ class DreameMowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # The mowing settings are stored per map, so they have to be re-read
             # whenever the active map changes.
             self.hass.create_task(self._async_refresh_preferences_on_map_change())
+        if property_name == MAP_SWITCH_ANNOUNCED_PROPERTY_NAME:
+            # The echo of a switch does not say which map is now active, so the
+            # map list is read back for it.
+            self.hass.create_task(self._async_refresh_current_map_on_switch())
         self._normalize_selection_state()
 
         # Handle device code error notifications
@@ -1154,6 +1162,15 @@ class DreameMowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "persistent_notification", "create",
             {"notification_id": notification_id, "title": title, "message": message},
         )
+
+    async def _async_refresh_current_map_on_switch(self) -> None:
+        """Re-read the active map after the mower announced a map switch."""
+        # The echo can arrive just ahead of the map list taking on the switch.
+        await asyncio.sleep(_MAP_SWITCH_READ_BACK_DELAY_SECONDS)
+        try:
+            await self.hass.async_add_executor_job(self.device.refresh_current_map_id)
+        except Exception as ex:
+            _LOGGER.warning("Active map refresh after a map switch failed: %s", ex)
 
     async def _async_refresh_preferences_on_map_change(self) -> None:
         """Re-read the mowing settings after the active map changed."""
