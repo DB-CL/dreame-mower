@@ -779,6 +779,34 @@ def has_map(vmap: MowerVectorMap) -> bool:
     return vmap.md5sum != "" or bool(vmap.zones)
 
 
+def _mow_paths_on_map(mow_paths: list[MowerMowPath], vmap: MowerVectorMap) -> list[MowerMowPath]:
+    """Keep the mowing trails that run on one map.
+
+    The maps of a mower share one coordinate system, and M_PATH holds the
+    trails of all of them, so each map keeps only the segments that run
+    mostly within its boundary. A map without a boundary keeps them all.
+    """
+    box = vmap.boundary
+    if box is None:
+        return mow_paths
+
+    x_min, x_max = sorted((box.x1, box.x2))
+    y_min, y_max = sorted((box.y1, box.y2))
+
+    def inside(point: tuple[int, int]) -> bool:
+        return x_min <= point[0] <= x_max and y_min <= point[1] <= y_max
+
+    kept: list[MowerMowPath] = []
+    for path in mow_paths:
+        segments = [
+            segment for segment in path.segments
+            if segment and 2 * sum(inside(point) for point in segment) > len(segment)
+        ]
+        if segments:
+            kept.append(MowerMowPath(zone_id=path.zone_id, segments=segments))
+    return kept
+
+
 def assemble_vector_map(
     parsed_maps: list[MowerVectorMap],
     mow_paths: list[MowerMowPath],
@@ -807,7 +835,7 @@ def assemble_vector_map(
     parsed_maps_by_id = {vmap.map_id: vmap for vmap in ordered_maps}
     for vmap in ordered_maps:
         vmap.available_maps = available_maps
-        vmap.mow_paths = mow_paths
+        vmap.mow_paths = mow_paths if len(ordered_maps) == 1 else _mow_paths_on_map(mow_paths, vmap)
 
     primary_map.maps = parsed_maps_by_id
     return primary_map
