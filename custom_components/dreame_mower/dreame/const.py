@@ -117,8 +117,8 @@ ACTION_PAUSE = ActionIdentifier(siid=5, aiid=4, name="pause")
 # Embedded protocol task payloads (sent via SCHEDULING_TASK_PROPERTY 2:50)
 # Format: {m: 'a', p: <priority>, o: <opcode>, d?: <data>}
 TASK_PAYLOAD_RESUME = {"m": "a", "p": 0, "o": 5}  # continueControl
-# Opcode of a switch of the active map. The mower echoes it on 2:50 whoever
-# switched, the app included, but without saying which map is now active.
+# Opcode of a switch of the active map. The mower may echo it on 2:50 after a
+# switch, the app's included, but without saying which map is now active.
 TASK_OPCODE_MAP_SWITCH = 200
 
 # Mowing preference ("PRE") records
