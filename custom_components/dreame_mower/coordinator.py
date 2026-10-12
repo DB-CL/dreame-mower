@@ -67,9 +67,9 @@ from .dreame.property.property_misc import (
 # a re-read. The device announces every change, including the ones it was just
 # told to make, and a write already knows what it wrote.
 _SETTINGS_WRITE_ECHO_SECONDS = 5.0
-# The mower echoes a map switch on 2:50 before its map list always reports the
-# new map, so the list is read back a few times until the active map moves.
-_MAP_SWITCH_READ_BACK_DELAYS_SECONDS = (2.0, 3.0, 5.0)
+# The map list is read back a moment after a switch is announced, once the
+# mower has applied it.
+_MAP_SWITCH_READ_BACK_DELAY_SECONDS = 2.0
 
 # The two records the device announces changes to, each with its own echo window
 # so a write to one does not suppress a re-read of the other.
@@ -113,6 +113,7 @@ class DreameMowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._anti_theft_settings: dict[str, Any] | None = None
         self._rain_protection_end_timestamp: int | None = None
         self._last_writes: dict[str, float] = {}
+        self._map_switch_read_pending = False
         self._preference_refresh: asyncio.Task[bool] | None = None
 
         # Initialize coordinator with no automatic polling (device will push updates)
@@ -1117,8 +1118,11 @@ class DreameMowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # Neither the echo of a switch nor the session marker (1:50) that
             # comes with it says which map is now active, so the map list is
             # read back for it. The echo does not always arrive; the marker
-            # was seen on every switch made in the app.
-            self.hass.create_task(self._async_refresh_current_map_on_switch())
+            # was seen on every switch made in the app. Both come within a
+            # second of each other, so one read covers them.
+            if not self._map_switch_read_pending:
+                self._map_switch_read_pending = True
+                self.hass.create_task(self._async_refresh_current_map_on_switch())
         self._normalize_selection_state()
 
         # Handle device code error notifications
@@ -1178,17 +1182,12 @@ class DreameMowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def _async_refresh_current_map_on_switch(self) -> None:
         """Re-read the active map after the mower announced a map switch."""
-        before = self.device.current_map_id
-        for delay in _MAP_SWITCH_READ_BACK_DELAYS_SECONDS:
-            await asyncio.sleep(delay)
-            try:
-                await self.hass.async_add_executor_job(self.device.refresh_current_map_id)
-            except Exception as ex:
-                _LOGGER.warning("Active map refresh after a map switch failed: %s", ex)
-                return
-            if self.device.current_map_id != before:
-                return
-        _LOGGER.debug("Map switch announced, but the active map stayed map ID %s", before)
+        await asyncio.sleep(_MAP_SWITCH_READ_BACK_DELAY_SECONDS)
+        self._map_switch_read_pending = False
+        try:
+            await self.hass.async_add_executor_job(self.device.refresh_current_map_id)
+        except Exception as ex:
+            _LOGGER.warning("Active map refresh after a map switch failed: %s", ex)
 
     async def _async_refresh_preferences_on_map_change(self) -> None:
         """Re-read the mowing settings after the active map changed."""

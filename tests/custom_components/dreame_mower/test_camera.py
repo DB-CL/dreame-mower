@@ -322,27 +322,27 @@ class TestActiveMapImage:
     @pytest.mark.asyncio
     async def test_shows_the_last_mission_of_the_active_map(self, camera_entity, mock_coordinator, tmp_path):
         """A more recent mission on another map is skipped."""
-        other, active = self._missions(tmp_path, "hash-pature", "hash-pelouse")
+        other, active = self._missions(tmp_path, "hash-other", "hash-active")
         camera_entity._cache_built = True
         camera_entity._historical_files_cache = [(other, 2.0), (active, 1.0)]
-        mock_coordinator.device.vector_map = Mock(md5sum="hash-pelouse")
+        mock_coordinator.device.vector_map = Mock(md5sum="hash-active")
 
         assert await camera_entity._find_most_recent_historical_file() == active
 
     @pytest.mark.asyncio
     async def test_draws_the_map_when_it_has_no_mission(self, camera_entity, mock_coordinator, tmp_path):
         """With no mission on the active map, the map itself is drawn."""
-        (other,) = self._missions(tmp_path, "hash-pature")
+        (other,) = self._missions(tmp_path, "hash-other")
         camera_entity._cache_built = True
         camera_entity._historical_files_cache = [(other, 2.0)]
-        mock_coordinator.device.vector_map = Mock(md5sum="hash-pelouse")
+        mock_coordinator.device.vector_map = Mock(md5sum="hash-active")
 
         assert await camera_entity._find_most_recent_historical_file() is None
 
     @pytest.mark.asyncio
     async def test_shows_the_last_mission_while_the_map_hash_is_unknown(self, camera_entity, mock_coordinator, tmp_path):
         """Without the active map's hash, the most recent mission is shown as before."""
-        first, second = self._missions(tmp_path, "hash-pature", "hash-pelouse")
+        first, second = self._missions(tmp_path, "hash-other", "hash-active")
         camera_entity._cache_built = True
         camera_entity._historical_files_cache = [(first, 2.0), (second, 1.0)]
         mock_coordinator.device.vector_map = Mock(md5sum=None)
@@ -363,7 +363,7 @@ class TestActiveMapImage:
     def test_reading_the_maps_redraws_the_static_map(self, camera_entity):
         """Once the maps are read, the image is redrawn for the active map."""
         camera_entity._session_active = False
-        camera_entity._current_map_data = {"md5": "hash-pature"}
+        camera_entity._current_map_data = {"md5": "hash-other"}
         camera_entity.hass = Mock()
         camera_entity.hass.create_task = Mock(side_effect=lambda coro: coro.close())
 

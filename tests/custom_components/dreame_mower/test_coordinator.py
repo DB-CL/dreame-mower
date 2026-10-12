@@ -145,32 +145,25 @@ async def test_coordinator_rereads_the_active_map_when_the_mower_announces_a_swi
 ):
     """A switch made in the app is echoed without the map, so the map list is read."""
     coordinator = DreameMowerCoordinator(hass, entry=minimal_config_entry)
-    coordinator.device._current_map_id = 2
+    coordinator.device.refresh_current_map_id = MagicMock(return_value=True)
 
-    def switch_on_second_read():
-        if coordinator.device.refresh_current_map_id.call_count == 2:
-            coordinator.device._current_map_id = 1
-        return True
-
-    coordinator.device.refresh_current_map_id = MagicMock(side_effect=switch_on_second_read)
-
-    with patch("custom_components.dreame_mower.coordinator._MAP_SWITCH_READ_BACK_DELAYS_SECONDS", (0, 0, 0)):
+    with patch("custom_components.dreame_mower.coordinator._MAP_SWITCH_READ_BACK_DELAY_SECONDS", 0):
         coordinator._handle_device_update(MAP_SWITCH_ANNOUNCED_PROPERTY_NAME, None)
         await hass.async_block_till_done()
 
-    # The first read still reported the old map; the second saw the switch.
-    assert coordinator.device.refresh_current_map_id.call_count == 2
+    coordinator.device.refresh_current_map_id.assert_called_once()
 
 
-async def test_coordinator_rereads_the_active_map_on_the_session_marker(
+async def test_coordinator_reads_the_map_list_once_for_echo_and_marker(
     hass: HomeAssistant, minimal_config_entry
 ):
-    """The 1:50 marker that comes with a switch also has the map list read."""
+    """The echo and the 1:50 marker of one switch cost a single read."""
     coordinator = DreameMowerCoordinator(hass, entry=minimal_config_entry)
     coordinator.device.refresh_current_map_id = MagicMock(return_value=True)
 
-    with patch("custom_components.dreame_mower.coordinator._MAP_SWITCH_READ_BACK_DELAYS_SECONDS", (0,)):
+    with patch("custom_components.dreame_mower.coordinator._MAP_SWITCH_READ_BACK_DELAY_SECONDS", 0):
         coordinator._handle_device_update("service1_property_50", True)
+        coordinator._handle_device_update(MAP_SWITCH_ANNOUNCED_PROPERTY_NAME, None)
         await hass.async_block_till_done()
 
     coordinator.device.refresh_current_map_id.assert_called_once()

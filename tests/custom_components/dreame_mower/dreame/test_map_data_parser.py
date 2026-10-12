@@ -639,16 +639,16 @@ def _map_with_box(map_id: int, x1: int, x2: int) -> MowerVectorMap:
 
 def test_assemble_keeps_each_maps_own_mowing_trails():
     """The maps share one coordinate system; each keeps the trails within it."""
-    pelouse = _map_with_box(1, -40000, 20000)
-    pature = _map_with_box(2, -130000, -35000)
-    on_pelouse = [(0, 0), (10000, 0), (10000, 500)]
-    on_pature = [(-120000, 0), (-90000, 0), (-90000, 500)]
-    trails = [MowerMowPath(zone_id=0, segments=[on_pature, on_pelouse])]
+    first = _map_with_box(1, -40000, 20000)
+    second = _map_with_box(2, -130000, -35000)
+    on_first = [(0, 0), (10000, 0), (10000, 500)]
+    on_second = [(-120000, 0), (-90000, 0), (-90000, 500)]
+    trails = [MowerMowPath(zone_id=0, segments=[on_second, on_first])]
 
-    assemble_vector_map([pelouse, pature], trails)
+    assemble_vector_map([first, second], trails)
 
-    assert pelouse.mow_paths == [MowerMowPath(zone_id=0, segments=[on_pelouse])]
-    assert pature.mow_paths == [MowerMowPath(zone_id=0, segments=[on_pature])]
+    assert first.mow_paths == [MowerMowPath(zone_id=0, segments=[on_first])]
+    assert second.mow_paths == [MowerMowPath(zone_id=0, segments=[on_second])]
 
 
 def test_assemble_keeps_all_trails_on_a_single_map():
@@ -663,25 +663,25 @@ def test_assemble_keeps_all_trails_on_a_single_map():
 
 def test_assemble_keeps_the_edge_pass_just_outside_a_zone():
     """The edge-mowing pass runs along the boundary, partly just outside it."""
-    pelouse = _map_with_box(1, 0, 10000)
-    pature = _map_with_box(2, -30000, -20000)
+    first = _map_with_box(1, 0, 10000)
+    second = _map_with_box(2, -30000, -20000)
     edge = [(x, 1500) for x in range(0, 10000, 1000)]  # 500 outside the top edge
     trails = [MowerMowPath(zone_id=0, segments=[edge])]
 
-    assemble_vector_map([pelouse, pature], trails)
+    assemble_vector_map([first, second], trails)
 
-    assert pelouse.mow_paths == trails
-    assert pature.mow_paths == []
+    assert first.mow_paths == trails
+    assert second.mow_paths == []
 
 
 def test_assemble_cuts_a_trail_where_it_leaves_the_map():
     """The drive from one map to the other is not drawn on either."""
-    pelouse = _map_with_box(1, 0, 10000)
-    pature = _map_with_box(2, -30000, -20000)
+    first = _map_with_box(1, 0, 10000)
+    second = _map_with_box(2, -30000, -20000)
     inside = [(x, 0) for x in range(1000, 9000, 1000)]
     drive = [(5000, y) for y in range(5000, 20000, 5000)]  # leaves the map
     trails = [MowerMowPath(zone_id=0, segments=[inside + drive])]
 
-    assemble_vector_map([pelouse, pature], trails)
+    assemble_vector_map([first, second], trails)
 
-    assert pelouse.mow_paths == [MowerMowPath(zone_id=0, segments=[inside])]
+    assert first.mow_paths == [MowerMowPath(zone_id=0, segments=[inside])]
