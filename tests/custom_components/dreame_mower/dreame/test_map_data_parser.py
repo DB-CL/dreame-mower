@@ -6,6 +6,9 @@ import pathlib
 import pytest
 
 from custom_components.dreame_mower.dreame.map_data_parser import (
+    MowerVectorMap,
+    MowerMowPath,
+    assemble_vector_map,
     MowerMapBoundary,
     convert_device_map,
     has_map,
@@ -620,3 +623,37 @@ def test_convert_device_map_stores_a_tilted_rectangle_the_way_it_renders():
     assert len({round(y, 3) for _, y in area.path}) == 2
     assert sorted(rendered) == sorted((round(x * 10), round(y * 10)) for x, y in corners)
 
+
+
+# ---------------------------------------------------------------------------
+# assemble_vector_map: mowing trails per map
+# ---------------------------------------------------------------------------
+
+def _map_with_box(map_id: int, x1: int, x2: int) -> MowerVectorMap:
+    vmap = MowerVectorMap(map_id=map_id, map_index=map_id - 1)
+    vmap.boundary = MowerMapBoundary(x1=x1, y1=-1000, x2=x2, y2=1000)
+    return vmap
+
+
+def test_assemble_keeps_each_maps_own_mowing_trails():
+    """The maps share one coordinate system; each keeps the trails within it."""
+    pelouse = _map_with_box(1, -400, 200)
+    pature = _map_with_box(2, -1300, -350)
+    on_pelouse = [(0, 0), (100, 0), (100, 10)]
+    on_pature = [(-1200, 0), (-900, 0), (-900, 10)]
+    trails = [MowerMowPath(zone_id=0, segments=[on_pature, on_pelouse])]
+
+    assemble_vector_map([pelouse, pature], trails)
+
+    assert pelouse.mow_paths == [MowerMowPath(zone_id=0, segments=[on_pelouse])]
+    assert pature.mow_paths == [MowerMowPath(zone_id=0, segments=[on_pature])]
+
+
+def test_assemble_keeps_all_trails_on_a_single_map():
+    """With a single map, every trail is its own."""
+    only = _map_with_box(1, -400, 200)
+    trails = [MowerMowPath(zone_id=0, segments=[[(-1200, 0), (-900, 0)]])]
+
+    assemble_vector_map([only], trails)
+
+    assert only.mow_paths == trails
