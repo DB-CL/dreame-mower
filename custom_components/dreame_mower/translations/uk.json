@@ -104,6 +104,12 @@
       "bluetooth_connection": {
         "name": "Блюдот"
       },
+      "wifi_signal": {
+        "name": "Сигнал Wi-Fi"
+      },
+      "cellular_signal": {
+        "name": "Стільниковий сигнал"
+      },
       "dnd_status": {
         "name": "Не турбувати"
       },
