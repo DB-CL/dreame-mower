@@ -61,7 +61,8 @@
           "map_rotation": "Map Rotation",
           "map_show_title": "Show Map Title",
           "map_show_legend": "Show Map Legend",
-          "map_padding": "Map Padding (pixels)"
+          "map_padding": "Map Padding (pixels)",
+          "map_fit": "Fit the image to the map's shape"
         }
       }
     }

@@ -672,3 +672,16 @@ def test_assemble_keeps_the_edge_pass_just_outside_a_zone():
 
     assert pelouse.mow_paths == trails
     assert pature.mow_paths == []
+
+
+def test_assemble_cuts_a_trail_where_it_leaves_the_map():
+    """The drive from one map to the other is not drawn on either."""
+    pelouse = _map_with_box(1, 0, 10000)
+    pature = _map_with_box(2, -30000, -20000)
+    inside = [(x, 0) for x in range(1000, 9000, 1000)]
+    drive = [(5000, y) for y in range(5000, 20000, 5000)]  # leaves the map
+    trails = [MowerMowPath(zone_id=0, segments=[inside + drive])]
+
+    assemble_vector_map([pelouse, pature], trails)
+
+    assert pelouse.mow_paths == [MowerMowPath(zone_id=0, segments=[inside])]

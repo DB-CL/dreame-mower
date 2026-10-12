@@ -12,7 +12,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import DATA_COORDINATOR, DATA_VIDEO_RUNTIME, DATA_VIDEO_SUPPORTED, DOMAIN, CONF_MAP_ROTATION, CONF_MAP_SHOW_TITLE, CONF_MAP_SHOW_LEGEND, CONF_MAP_PADDING
+from .const import DATA_COORDINATOR, DATA_VIDEO_RUNTIME, DATA_VIDEO_SUPPORTED, DOMAIN, CONF_MAP_ROTATION, CONF_MAP_SHOW_TITLE, CONF_MAP_SHOW_LEGEND, CONF_MAP_PADDING, CONF_MAP_FIT
 from .coordinator import DreameMowerCoordinator
 from .entity import DreameMowerEntity
 from .live_camera import create_live_camera
@@ -95,6 +95,7 @@ class DreameMowerCameraEntity(DreameMowerEntity, Camera):
         self._current_show_title = self.config_entry.options.get(CONF_MAP_SHOW_TITLE, True)
         self._current_show_legend = self.config_entry.options.get(CONF_MAP_SHOW_LEGEND, True)
         self._current_padding = self.config_entry.options.get(CONF_MAP_PADDING, 50)
+        self._current_fit = self.config_entry.options.get(CONF_MAP_FIT, False)
 
     async def async_added_to_hass(self) -> None:
         """Called when entity is added to Home Assistant."""
@@ -177,16 +178,19 @@ class DreameMowerCameraEntity(DreameMowerEntity, Camera):
         new_show_title = entry.options.get(CONF_MAP_SHOW_TITLE, True)
         new_show_legend = entry.options.get(CONF_MAP_SHOW_LEGEND, True)
         new_padding = entry.options.get(CONF_MAP_PADDING, 50)
+        new_fit = entry.options.get(CONF_MAP_FIT, False)
         changed = (
             new_rotation != self._current_rotation
             or new_show_title != self._current_show_title
             or new_show_legend != self._current_show_legend
             or new_padding != self._current_padding
+            or new_fit != self._current_fit
         )
         self._current_rotation = new_rotation
         self._current_show_title = new_show_title
         self._current_show_legend = new_show_legend
         self._current_padding = new_padding
+        self._current_fit = new_fit
         if changed:
             # Re-render the image with new settings
             if self._is_on:
@@ -406,6 +410,7 @@ class DreameMowerCameraEntity(DreameMowerEntity, Camera):
             show_title=self._current_show_title,
             show_legend=self._current_show_legend,
             padding=self._current_padding,
+            fit=self._current_fit,
         )
 
     @property
@@ -568,6 +573,7 @@ class DreameMowerCameraEntity(DreameMowerEntity, Camera):
             show_title=self._current_show_title,
             show_legend=self._current_show_legend,
             padding=self._current_padding,
+            fit=self._current_fit,
         )
 
     @property

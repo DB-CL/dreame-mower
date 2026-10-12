@@ -20,6 +20,7 @@ from custom_components.dreame_mower.dreame.svg_map_generator import (
     svg_text_with_background,
     finish_svg_document,
     generate_svg_map_image,
+    fit_canvas,
 )
 
 
@@ -429,3 +430,32 @@ class TestMapRotation:
             f"Actual output saved to {output_svg_file}. "
             f"If the changes are intentional, update the golden file."
         )
+
+
+class TestFitCanvas:
+    """The canvas can take on the map's proportions instead of a square."""
+
+    def test_a_wide_map_gets_a_wide_canvas(self):
+        """A map three times wider than tall keeps the full width, a third of the height."""
+        width, height = fit_canvas((0, 0, 90000, 30000), padding=10)
+        assert width == 1200
+        assert height == round(1180 / 3) + 20 + 30
+
+    def test_a_tall_map_gets_a_tall_canvas(self):
+        """A map taller than wide keeps the full height."""
+        width, height = fit_canvas((0, 0, 30000, 60000), padding=10)
+        assert height == 1200
+        assert width == round((1200 - 20 - 30) / 2) + 20
+
+    def test_a_long_narrow_map_keeps_a_readable_canvas(self):
+        """The short side never shrinks below the minimum."""
+        assert fit_canvas((0, 0, 100000, 1000), padding=10)[1] == 300
+
+    def test_the_generated_image_takes_the_fitted_size(self, mock_coordinator):
+        """With fit, the SVG document is sized to the map, not square."""
+        mock_coordinator.device.mower_coordinates = None
+        data = {"map": [{"data": [[0, 0], [90000, 0], [90000, 30000], [0, 30000], [0, 0]], "track": []}]}
+
+        svg = generate_svg_map_image(data, None, mock_coordinator, rotation=0, padding=10, fit=True).decode()
+
+        assert '<svg width="1200" height="443" viewBox="0 0 1200 443"' in svg

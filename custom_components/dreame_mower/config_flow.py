@@ -19,7 +19,7 @@ from homeassistant.helpers.device_registry import format_mac
 from homeassistant.core import callback
 
 from .dreame.cloud.cloud_base import DreameMowerCloudBase
-from .const import CONF_NOTIFY, CONF_MAP_ROTATION, CONF_MAP_SHOW_TITLE, CONF_MAP_SHOW_LEGEND, CONF_MAP_PADDING, DOMAIN
+from .const import CONF_NOTIFY, CONF_MAP_ROTATION, CONF_MAP_SHOW_TITLE, CONF_MAP_SHOW_LEGEND, CONF_MAP_PADDING, CONF_MAP_FIT, DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -418,6 +418,7 @@ class DreameMowerOptionsFlow(OptionsFlow):
         current_show_title = self.config_entry.options.get(CONF_MAP_SHOW_TITLE, True)
         current_show_legend = self.config_entry.options.get(CONF_MAP_SHOW_LEGEND, True)
         current_padding = self.config_entry.options.get(CONF_MAP_PADDING, 50)
+        current_fit = self.config_entry.options.get(CONF_MAP_FIT, False)
         return self.async_show_form(
             step_id="init",
             data_schema=vol.Schema({
@@ -426,6 +427,7 @@ class DreameMowerOptionsFlow(OptionsFlow):
                 vol.Required(CONF_MAP_SHOW_TITLE, default=current_show_title): bool,
                 vol.Required(CONF_MAP_SHOW_LEGEND, default=current_show_legend): bool,
                 vol.Required(CONF_MAP_PADDING, default=current_padding): vol.All(int, vol.Range(min=0, max=200)),
+                vol.Required(CONF_MAP_FIT, default=current_fit): bool,
             }),
             description_placeholders=self._account_placeholders(),
         )

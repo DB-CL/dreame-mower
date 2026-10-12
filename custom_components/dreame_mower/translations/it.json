@@ -61,7 +61,8 @@
           "map_rotation": "Rotazione mappa",
           "map_show_title": "Mostra titolo mappa",
           "map_show_legend": "Mostra legenda mappa",
-          "map_padding": "Margine mappa (pixel)"
+          "map_padding": "Margine mappa (pixel)",
+          "map_fit": "Adatta l'immagine alla forma della mappa"
         }
       }
     }
