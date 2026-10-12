@@ -10,6 +10,7 @@ from custom_components.dreame_mower.dreame.map_data_parser import (
     MowerZone,
     MowerMowPath,
     assemble_vector_map,
+    outline_matches_zones,
     MowerMapBoundary,
     convert_device_map,
     has_map,
@@ -685,3 +686,44 @@ def test_assemble_cuts_a_trail_where_it_leaves_the_map():
     assemble_vector_map([first, second], trails)
 
     assert first.mow_paths == [MowerMowPath(zone_id=0, segments=[inside])]
+
+
+# ---------------------------------------------------------------------------
+# outline_matches_zones
+# ---------------------------------------------------------------------------
+
+_SQUARE = [(0, 0), (40000, 0), (40000, 40000), (0, 40000)]
+
+
+def _outline(points, step=1000):
+    """Densify a closed polygon into an outline with a point every step."""
+    out = []
+    for (ax, ay), (bx, by) in zip(points, points[1:] + points[:1]):
+        n = max(abs(bx - ax), abs(by - ay)) // step
+        out.extend((ax + (bx - ax) * i // n, ay + (by - ay) * i // n) for i in range(n))
+    return out
+
+
+def test_outline_of_the_same_map_matches():
+    """The outline recorded in a mission matches the map it was mowed on."""
+    zones = [MowerZone(zone_id=1, path=_SQUARE)]
+    assert outline_matches_zones([_outline(_SQUARE)], zones) is True
+
+
+def test_outline_of_a_neighbouring_map_does_not_match():
+    """A map that only touches the active one is not taken for it."""
+    neighbour = [(40000, 0), (90000, 0), (90000, 40000), (40000, 40000)]
+    zones = [MowerZone(zone_id=1, path=_SQUARE)]
+    assert outline_matches_zones([_outline(neighbour)], zones) is False
+
+
+def test_outline_of_part_of_the_map_does_not_match():
+    """An outline covering only part of the map is not its outline."""
+    part = [(0, 0), (40000, 0), (40000, 10000), (0, 10000)]
+    zones = [MowerZone(zone_id=1, path=_SQUARE)]
+    assert outline_matches_zones([_outline(part)], zones) is False
+
+
+def test_no_outline_does_not_match():
+    """A mission without an outline belongs to no map."""
+    assert outline_matches_zones([], [MowerZone(zone_id=1, path=_SQUARE)]) is False
