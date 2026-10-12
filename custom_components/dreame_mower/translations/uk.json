@@ -148,6 +148,9 @@
     "camera": {
       "map_camera": {
         "name": "Карта"
+      },
+      "live_camera": {
+        "name": "Камера в реальному часі"
       }
     },
     "button": {
@@ -205,6 +208,9 @@
       },
       "edge_mowing_safe": {
         "name": "Безпечне обкошування країв"
+      },
+      "live_video": {
+        "name": "Відео в реальному часі"
       }
     },
     "time": {

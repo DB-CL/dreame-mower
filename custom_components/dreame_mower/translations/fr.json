@@ -148,6 +148,9 @@
     "camera": {
       "map_camera": {
         "name": "Carte"
+      },
+      "live_camera": {
+        "name": "Caméra en direct"
       }
     },
     "button": {
@@ -205,6 +208,9 @@
       },
       "edge_mowing_safe": {
         "name": "Tonte des bordures sécurisée"
+      },
+      "live_video": {
+        "name": "Vidéo en direct"
       }
     },
     "time": {

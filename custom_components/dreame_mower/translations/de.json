@@ -148,6 +148,9 @@
     "camera": {
       "map_camera": {
         "name": "Karte"
+      },
+      "live_camera": {
+        "name": "Live-Kamera"
       }
     },
     "button": {
@@ -205,6 +208,9 @@
       },
       "edge_mowing_safe": {
         "name": "Sicheres Randmähen"
+      },
+      "live_video": {
+        "name": "Live-Video"
       }
     },
     "time": {

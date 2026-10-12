@@ -148,6 +148,9 @@
     "camera": {
       "map_camera": {
         "name": "Mapa"
+      },
+      "live_camera": {
+        "name": "Câmara em direto"
       }
     },
     "button": {
@@ -205,6 +208,9 @@
       },
       "edge_mowing_safe": {
         "name": "Corte seguro de bordas"
+      },
+      "live_video": {
+        "name": "Vídeo em direto"
       }
     },
     "time": {

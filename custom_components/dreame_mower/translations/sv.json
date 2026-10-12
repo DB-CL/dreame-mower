@@ -148,6 +148,9 @@
     "camera": {
       "map_camera": {
         "name": "Karta"
+      },
+      "live_camera": {
+        "name": "Livekamera"
       }
     },
     "button": {
@@ -205,6 +208,9 @@
       },
       "edge_mowing_safe": {
         "name": "Säker kantklippning"
+      },
+      "live_video": {
+        "name": "Livevideo"
       }
     },
     "time": {

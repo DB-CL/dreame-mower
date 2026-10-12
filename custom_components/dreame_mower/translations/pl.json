@@ -148,6 +148,9 @@
     "camera": {
       "map_camera": {
         "name": "Mapa"
+      },
+      "live_camera": {
+        "name": "Kamera na żywo"
       }
     },
     "button": {
@@ -205,6 +208,9 @@
       },
       "edge_mowing_safe": {
         "name": "Bezpieczne koszenie krawędzi"
+      },
+      "live_video": {
+        "name": "Wideo na żywo"
       }
     },
     "time": {

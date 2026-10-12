@@ -165,6 +165,9 @@
     "camera": {
       "map_camera": {
         "name": "Map"
+      },
+      "live_camera": {
+        "name": "Live camera"
       }
     },
     "number": {
@@ -205,6 +208,9 @@
       },
       "edge_mowing_safe": {
         "name": "Safe Edge Mowing"
+      },
+      "live_video": {
+        "name": "Live video"
       }
     },
     "time": {
