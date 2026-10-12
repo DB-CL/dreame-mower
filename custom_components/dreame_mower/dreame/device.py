@@ -107,6 +107,8 @@ from .const import (
     ONLINE_OFFLINE_DEBOUNCE_POLLS,
     TRANSPORT_DISCONNECT_GRACE_SECONDS,
     CURRENT_MAP_ID_PROPERTY_NAME,
+    MAP_SWITCH_ANNOUNCED_PROPERTY_NAME,
+    TASK_OPCODE_MAP_SWITCH,
     CUTTING_HEIGHT_ABSOLUTE_MAX_CM,
     CUTTING_HEIGHT_MIN_CM,
     CUTTING_HEIGHT_STEP_CM,
@@ -1405,6 +1407,8 @@ class DreameMowerDevice:
                 # Handle scheduling properties (2:50, 2:52) in unified handler
                 if not self._scheduling_handler.handle_property_update(siid, piid, message["value"], self._notify_property_change):
                     return False  # Parsing failed - treat as unhandled property
+                if SCHEDULING_TASK_PROPERTY.matches(siid, piid) and self._is_map_switch_echo(message["value"]):
+                    self._notify_property_change(MAP_SWITCH_ANNOUNCED_PROPERTY_NAME, None)
             elif MOWER_CONTROL_STATUS_PROPERTY.matches(siid, piid):
                 # Handle mower control status property (2:56)
                 if not self._mower_control_handler.handle_property_update(siid, piid, message["value"], self._notify_property_change):
@@ -4239,12 +4243,20 @@ class DreameMowerDevice:
             },
         }
 
+    @staticmethod
+    def _is_map_switch_echo(value: Any) -> bool:
+        """Return whether a 2:50 task report is the echo of a map switch."""
+        if not isinstance(value, dict) or value.get("t") != "TASK":
+            return False
+        data = value.get("d")
+        return isinstance(data, dict) and data.get("o") == TASK_OPCODE_MAP_SWITCH
+
     def _build_set_current_map_payload(self, map_index: int) -> dict[str, Any]:
         """Build the 2:50 action payload for switching the active map."""
         return {
             "m": "a",
             "p": 0,
-            "o": 200,
+            "o": TASK_OPCODE_MAP_SWITCH,
             "d": {
                 "idx": map_index,
             },

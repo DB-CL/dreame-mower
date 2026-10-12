@@ -1520,6 +1520,21 @@ def test_service2_property_62_handling(device):
     assert ("service2_property_62", 0) in property_changes
 
 
+@pytest.mark.parametrize("value,announced", [
+    # Echo of a switch made in the Dreame app, as a g2541e reported it.
+    ({"d": {"exe": True, "o": 200, "status": True}, "t": "TASK"}, True),
+    # Echo of a mowing task.
+    ({"d": {"exe": True, "o": 100, "status": True, "region_id": [1]}, "t": "TASK"}, False),
+])
+def test_map_switch_echo_is_announced(device, value, announced):
+    """The 2:50 echo of a map switch is passed on so the active map is re-read."""
+    property_changes = []
+    device.register_property_callback(lambda n, v: property_changes.append((n, v)))
+
+    assert device._handle_mqtt_property_update({"siid": 2, "piid": 50, "value": value}) is True
+    assert (("map_switch_announced", None) in property_changes) is announced
+
+
 def test_service2_property_55_handling(device):
     """Test Service 2 property 55 (2:55) AI obstacle detection handling (issue #32)."""
     property_changes = []
