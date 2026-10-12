@@ -779,28 +779,77 @@ def has_map(vmap: MowerVectorMap) -> bool:
     return vmap.md5sum != "" or bool(vmap.zones)
 
 
+# How far outside its zones a trail point still counts as on the map, in map
+# units (mm): the edge-mowing pass runs along the boundary, partly outside it.
+_TRAIL_EDGE_TOLERANCE = 1000
+
+
+def _inside_polygon(point: tuple[int, int], polygon: list[tuple[int, int]]) -> bool:
+    """Return whether a point lies inside a polygon (even-odd rule)."""
+    x, y = point
+    inside = False
+    j = len(polygon) - 1
+    for i in range(len(polygon)):
+        xi, yi = polygon[i]
+        xj, yj = polygon[j]
+        if (yi > y) != (yj > y) and x < (xj - xi) * (y - yi) / (yj - yi) + xi:
+            inside = not inside
+        j = i
+    return inside
+
+
+def _near_polygon(point: tuple[int, int], polygon: list[tuple[int, int]], tolerance: float) -> bool:
+    """Return whether a point lies within tolerance of a polygon's outline."""
+    px, py = point
+    limit = tolerance * tolerance
+    j = len(polygon) - 1
+    for i in range(len(polygon)):
+        ax, ay = polygon[j]
+        bx, by = polygon[i]
+        dx, dy = bx - ax, by - ay
+        length = dx * dx + dy * dy
+        t = 0.0 if length == 0 else max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / length))
+        cx, cy = ax + t * dx - px, ay + t * dy - py
+        if cx * cx + cy * cy <= limit:
+            return True
+        j = i
+    return False
+
+
 def _mow_paths_on_map(mow_paths: list[MowerMowPath], vmap: MowerVectorMap) -> list[MowerMowPath]:
     """Keep the mowing trails that run on one map.
 
     The maps of a mower share one coordinate system, and M_PATH holds the
     trails of all of them, so each map keeps only the segments that run
-    mostly within its boundary. A map without a boundary keeps them all.
+    mostly within its zones. A map without zones keeps them all.
     """
-    box = vmap.boundary
-    if box is None:
+    polygons = [zone.path for zone in vmap.zones if len(zone.path) >= 3]
+    if not polygons:
         return mow_paths
 
-    x_min, x_max = sorted((box.x1, box.x2))
-    y_min, y_max = sorted((box.y1, box.y2))
+    boxes = [
+        (
+            min(x for x, _ in polygon) - _TRAIL_EDGE_TOLERANCE,
+            max(x for x, _ in polygon) + _TRAIL_EDGE_TOLERANCE,
+            min(y for _, y in polygon) - _TRAIL_EDGE_TOLERANCE,
+            max(y for _, y in polygon) + _TRAIL_EDGE_TOLERANCE,
+        )
+        for polygon in polygons
+    ]
 
-    def inside(point: tuple[int, int]) -> bool:
-        return x_min <= point[0] <= x_max and y_min <= point[1] <= y_max
+    def on_map(point: tuple[int, int]) -> bool:
+        for polygon, (x_min, x_max, y_min, y_max) in zip(polygons, boxes):
+            if not (x_min <= point[0] <= x_max and y_min <= point[1] <= y_max):
+                continue
+            if _inside_polygon(point, polygon) or _near_polygon(point, polygon, _TRAIL_EDGE_TOLERANCE):
+                return True
+        return False
 
     kept: list[MowerMowPath] = []
     for path in mow_paths:
         segments = [
             segment for segment in path.segments
-            if segment and 2 * sum(inside(point) for point in segment) > len(segment)
+            if segment and 2 * sum(on_map(point) for point in segment) > len(segment)
         ]
         if segments:
             kept.append(MowerMowPath(zone_id=path.zone_id, segments=segments))
