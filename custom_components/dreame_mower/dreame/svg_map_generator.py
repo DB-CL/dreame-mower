@@ -6,7 +6,7 @@ for better quality and HAOS compatibility.
 
 import logging
 from typing import Any, Dict, List, Tuple
-from datetime import datetime
+from datetime import datetime, timezone
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -118,6 +118,22 @@ def coord_to_pixel(x: int, y: int, bounds: Tuple[int, int, int, int],
     pixel_y = int(offset_y + (max_y - y) * scale)
     
     return pixel_x, pixel_y
+
+
+def _split_segments(points: List[List[int]]) -> List[List[List[int]]]:
+    """Split a point list on the segment break marker into its segments."""
+    segments: List[List[List[int]]] = []
+    current: List[List[int]] = []
+    for point in points:
+        if point[0] == 2147483647 and point[1] == 2147483647:
+            if len(current) > 1:
+                segments.append(current)
+            current = []
+        else:
+            current.append(point)
+    if len(current) > 1:
+        segments.append(current)
+    return segments
 
 
 def create_svg_document(width: int, height: int, background_color: str = "white") -> List[str]:
@@ -233,6 +249,11 @@ def finish_svg_document(svg_lines: List[str]) -> str:
 
 
 
+# Trail colours of the missions of one mowing, newest first: the latest in the
+# usual mowing path colour, the earlier ones each in their own.
+SESSION_COLORS = ['#ffa500', '#8e44ad', '#16a085', '#2980b9', '#c0392b', '#7f8c8d']
+
+
 def _scale_map_data(data: Dict[str, Any], factor: int = 10) -> Dict[str, Any]:
     """Scale all coordinate points in map data by the given factor.
 
@@ -258,6 +279,9 @@ def _scale_map_data(data: Dict[str, Any], factor: int = 10) -> Dict[str, Any]:
                 scaled_item["track"] = scale_points(scaled_item["track"])
             scaled_maps.append(scaled_item)
         result["map"] = scaled_maps
+
+    if "session_tracks" in result:
+        result["session_tracks"] = [scale_points(track) for track in result["session_tracks"]]
 
     if "obstacle" in result:
         scaled_obs = []
@@ -353,6 +377,12 @@ def generate_svg_map_image(data: Dict[str, Any], historical_file_path: str | Non
 
                 zone_data.append((zone_segments, zone_track_segments, item_name, item_type))
 
+        # The trails of a mowing spread over several missions, oldest first
+        session_tracks: List[List[List[int]]] = data.get("session_tracks") or []
+        if not live_coordinates:
+            for track in session_tracks:
+                all_points.extend(track)
+
         # Add obstacle points
         obstacles = data.get("obstacle", [])
         for obstacle in obstacles:
@@ -427,7 +457,16 @@ def generate_svg_map_image(data: Dict[str, Any], historical_file_path: str | Non
 
             # 3. Draw mowing tracks per zone (skip in live mode — replaced by live path)
             #    type=1 inter-zone paths are drawn as dashed grey in step 5 style
-            if not live_coordinates:
+            #    A mowing spread over several missions draws each one's trail
+            #    in its own colour instead, the latest in the usual one.
+            if not live_coordinates and session_tracks:
+                for n, track in enumerate(session_tracks):
+                    color = SESSION_COLORS[(len(session_tracks) - 1 - n) % len(SESSION_COLORS)]
+                    session_path = svg_path_from_segments(
+                        _split_segments(track), bounds, MAP_IMAGE_WIDTH, MAP_IMAGE_HEIGHT, color, 2, padding=padding)
+                    if session_path:
+                        svg_lines.append(session_path)
+            elif not live_coordinates:
                 for i, (_z_segs, z_tracks, _z_name, z_type) in enumerate(zone_data):
                     if z_tracks and z_type == 0:
                         track_path = svg_path_from_segments(z_tracks, bounds, MAP_IMAGE_WIDTH, MAP_IMAGE_HEIGHT, COLORS_SVG['mowing_path'], 2, padding=padding)
@@ -522,7 +561,16 @@ def generate_svg_map_image(data: Dict[str, Any], historical_file_path: str | Non
             has_tracks = any(z_tracks for _, z_tracks, _, _ in zone_data)
             if has_segments and not multi_zone:
                 legend_items.append(("Map Boundary", COLORS_SVG['map_boundary']))
-            if has_tracks and not live_coordinates:
+            if session_tracks and not live_coordinates:
+                starts = data.get("session_starts") or []
+                for n in range(len(session_tracks)):
+                    start = starts[n] if n < len(starts) else None
+                    # In UTC, like the "Started" line
+                    label = (datetime.fromtimestamp(start, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+                             if start else f"Session {n + 1}")
+                    color = SESSION_COLORS[(len(session_tracks) - 1 - n) % len(SESSION_COLORS)]
+                    legend_items.append((f"Mowing {label}", color))
+            elif has_tracks and not live_coordinates:
                 legend_items.append(("Mowing Path", COLORS_SVG['mowing_path']))
             if obstacles:
                 legend_items.append(("Obstacles", COLORS_SVG['obstacle']))
@@ -581,7 +629,6 @@ def generate_svg_map_image(data: Dict[str, Any], historical_file_path: str | Non
             # Add timestamp from map data (use 'start' timestamp if available)
             start_timestamp = data.get("start")
             if start_timestamp:
-                from datetime import timezone
                 timestamp = datetime.fromtimestamp(start_timestamp, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
                 timestamp_text = f"Started: {timestamp}"
             else:

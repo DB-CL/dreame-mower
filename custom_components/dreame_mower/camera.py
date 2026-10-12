@@ -16,16 +16,23 @@ from .const import DATA_COORDINATOR, DOMAIN, CONF_MAP_ROTATION, CONF_MAP_SHOW_TI
 from .coordinator import DreameMowerCoordinator
 from .entity import DreameMowerEntity
 
-from .dreame.const import POSE_COVERAGE_PROPERTY
+from .dreame.const import CURRENT_MAP_ID_PROPERTY_NAME, POSE_COVERAGE_PROPERTY
 from .dreame.property.pose_coverage import POSE_COVERAGE_COORDINATES_PROPERTY_NAME
 from .dreame.property.property_misc import PROPERTY_1_1_TASK_STATUS_NAME
-from .dreame.map_data_parser import vector_map_to_map_data
+from .dreame.map_data_parser import outline_matches_zones, vector_map_to_map_data
 from .dreame.svg_map_generator import generate_svg_map_image
 
 _LOGGER = logging.getLogger(__name__)
 
 # Pose coverage property request interval during live mowing sessions
 POSE_COVERAGE_REQUEST_INTERVAL = 120  # 2 minutes in seconds
+
+# Marker between the segments of a point list in mission files
+_SEGMENT_BREAK = 2147483647
+# Mission result of a task the mower finished, as opposed to one it stopped
+_MISSION_RESULT_FINISHED = 1
+# Most stopped tasks of one mowing drawn together
+_MAX_CYCLE_SESSIONS = 6
 
 
 async def async_setup_entry(
@@ -76,6 +83,12 @@ class DreameMowerCameraEntity(DreameMowerEntity, Camera):
         # Historical files cache
         self._historical_files_cache: list[tuple[str, float]] = []  # [(file_path, mtime), ...]
         self._cache_built = False
+        # Zone outlines recorded in each mission file, by file path, and whether
+        # a mission is on a map, by file path and the map's zone outlines
+        self._mission_outlines: dict[str, list[list[tuple[int, int]]]] = {}
+        self._mission_on_map: dict[tuple[str, int], bool] = {}
+        # Whether each mission file records a finished task, by file path
+        self._mission_finished: dict[str, bool] = {}
         
         # Track current rotation to detect changes
         self._current_rotation = self.config_entry.options.get(CONF_MAP_ROTATION, 0)
@@ -315,10 +328,13 @@ class DreameMowerCameraEntity(DreameMowerEntity, Camera):
             _LOGGER.info("Device is back online, resuming pose coverage requests")
             self._start_pose_coverage_timer()
 
-        if property_name == "vector_map_updated":
-            # Vector map data was fetched — re-render if we have no historical data
-            if not self._current_map_data and self._is_on:
-                self.hass.create_task(self._async_update_vector_map_image())
+        if property_name in ("vector_map_updated", CURRENT_MAP_ID_PROPERTY_NAME):
+            # The static map shows the active map, so it is redrawn once the maps
+            # are read (which tells which missions belong to the active map) and
+            # on every switch. The live map is drawn on the map being mowed and
+            # is left alone.
+            if not self._session_active and self._is_on:
+                self.hass.create_task(self._async_update_image())
         elif property_name == POSE_COVERAGE_COORDINATES_PROPERTY_NAME:
             self._handle_live_coordinates_update(value)
         elif property_name == PROPERTY_1_1_TASK_STATUS_NAME:
@@ -434,26 +450,114 @@ class DreameMowerCameraEntity(DreameMowerEntity, Camera):
             _LOGGER.error("Error reading historical file %s: %s", full_path, ex)
             return None
 
-    async def _find_most_recent_historical_file(self, force_refresh: bool = False) -> str | None:
-        """Find the most recent historical file using the cached file list.
-        
-        Returns:
-            Full path to the most recent .json file, or None if none found
+    def _mission_outlines_sync(self, full_path: str) -> list[list[tuple[int, int]]]:
+        """Return the mowing zone outlines a mission file recorded, in map units (cached per file)."""
+        if full_path not in self._mission_outlines:
+            data = self._load_historical_file_sync(full_path)
+            self._mission_finished[full_path] = (
+                isinstance(data, dict) and data.get("result") == _MISSION_RESULT_FINISHED
+            )
+            outlines: list[list[tuple[int, int]]] = []
+            items = data.get("map", []) if isinstance(data, dict) else []
+            for item in items if isinstance(items, list) else []:
+                if not isinstance(item, dict) or item.get("type", 0) != 0:
+                    continue  # passages and no-go areas are not the map's outline
+                outline: list[tuple[int, int]] = []
+                for point in item.get("data", []):
+                    if point[0] == _SEGMENT_BREAK and point[1] == _SEGMENT_BREAK:
+                        outlines.append(outline)
+                        outline = []
+                    else:
+                        # Mission files store decimeters, maps a unit ten times finer.
+                        outline.append((point[0] * 10, point[1] * 10))
+                outlines.append(outline)
+            self._mission_outlines[full_path] = [o for o in outlines if o]
+        return self._mission_outlines[full_path]
+
+    def _current_cycle_on_map_sync(self, zones: list[Any]) -> list[str]:
+        """Return the mission files of the latest mowing of the map with these zones, newest first.
+
+        That is the latest mission when the mower finished it, and otherwise
+        the stopped missions since the last finished one: a mowing the mower
+        stopped and resumed is spread over several missions, each holding only
+        its own part.
+        """
+        zones_key = hash(tuple(tuple(map(tuple, zone.path)) for zone in zones))
+        cycle: list[str] = []
+        for full_path, _mtime in self._historical_files_cache:
+            key = (full_path, zones_key)
+            if key not in self._mission_on_map:
+                # Comparing outlines takes a while, so each mission is compared
+                # with a map once, until the map's outline changes.
+                self._mission_on_map[key] = outline_matches_zones(self._mission_outlines_sync(full_path), zones)
+            if not self._mission_on_map[key]:
+                continue
+            if self._mission_finished.get(full_path):
+                if not cycle:
+                    cycle.append(full_path)
+                break
+            cycle.append(full_path)
+            if len(cycle) == _MAX_CYCLE_SESSIONS:
+                break
+        return cycle
+
+    async def _find_current_cycle(self, force_refresh: bool = False) -> list[str]:
+        """Find the mission files of the latest mowing of the active map, newest first.
+
+        A mission file records the outline of the map it was mowed on, so
+        only missions whose outline is that of the active map are shown, and
+        switching maps does not leave the previous map's missions on screen.
+        Without such a mission the map itself is drawn. The map's hash is no
+        use here: it changes without the outline changing.
         """
         try:
             # Build cache if not built yet
             if not self._cache_built or force_refresh:
                 await self._refresh_historical_files_cache()
-            
-            # Return the most recent file from cache
-            if self._historical_files_cache:
-                return self._historical_files_cache[0][0]  # First item is most recent
-            else:
-                return None
-                
+
+            if not self._historical_files_cache:
+                return []
+
+            vector_map = self.coordinator.device.vector_map
+            zones = list(vector_map.zones) if vector_map is not None else []
+            if not zones:
+                return [self._historical_files_cache[0][0]]  # First item is most recent
+
+            return await asyncio.get_event_loop().run_in_executor(
+                None, self._current_cycle_on_map_sync, zones
+            )
+
         except Exception as ex:
             _LOGGER.error("Error getting most recent historical file from cache: %s", ex)
+            return []
+
+    async def _find_most_recent_historical_file(self, force_refresh: bool = False) -> str | None:
+        """Find the most recent mission file of the active map, or None."""
+        cycle = await self._find_current_cycle(force_refresh=force_refresh)
+        return cycle[0] if cycle else None
+
+    def _load_cycle_sync(self, cycle: list[str]) -> dict[str, Any] | None:
+        """Load the missions of one mowing as one map, each mission's trail apart.
+
+        The newest mission gives the outline, obstacles and dock; with more
+        than one mission, their trails go to "session_tracks", oldest first,
+        so that each is drawn in its own colour.
+        """
+        missions = [self._load_historical_file_sync(path) for path in cycle]
+        if not missions or missions[0] is None:
             return None
+        data = dict(missions[0])
+        loaded = [m for m in missions if isinstance(m, dict)]
+        if len(loaded) > 1:
+            oldest_first = list(reversed(loaded))
+            data["session_tracks"] = [
+                [point for item in mission.get("map", []) if item.get("type", 0) == 0
+                 for point in item.get("track", []) + [[_SEGMENT_BREAK, _SEGMENT_BREAK]]]
+                for mission in oldest_first
+            ]
+            data["session_starts"] = [mission.get("start") for mission in oldest_first]
+            data["start"] = oldest_first[0].get("start")
+        return data
 
     async def _async_update_vector_map_image(self) -> None:
         """Update camera image using the vector map."""
@@ -475,9 +579,12 @@ class DreameMowerCameraEntity(DreameMowerEntity, Camera):
     async def _async_update_image(self, force_refresh: bool = False) -> None:
         """Update the camera image by generating a new map visualization."""
 
-        historical_file = await self._find_most_recent_historical_file(force_refresh=force_refresh)
+        cycle = await self._find_current_cycle(force_refresh=force_refresh)
+        historical_file = cycle[0] if cycle else None
         if not historical_file:
-            # No historical files — try the vector map
+            # No mission to show — draw the map itself
+            self._current_map_data = None
+            self._historical_file_path = None
             await self._async_update_vector_map_image()
             return
 
@@ -486,8 +593,8 @@ class DreameMowerCameraEntity(DreameMowerEntity, Camera):
             loop = asyncio.get_event_loop()
             self._current_map_data = await loop.run_in_executor(
                 None,
-                self._load_historical_file_sync,
-                historical_file
+                self._load_cycle_sync,
+                cycle
             )
             if self._current_map_data is None:
                 _LOGGER.warning("Failed to load historical file data: %s", historical_file)

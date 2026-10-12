@@ -6,6 +6,11 @@ import pathlib
 import pytest
 
 from custom_components.dreame_mower.dreame.map_data_parser import (
+    MowerVectorMap,
+    MowerZone,
+    MowerMowPath,
+    assemble_vector_map,
+    outline_matches_zones,
     MowerMapBoundary,
     convert_device_map,
     has_map,
@@ -620,3 +625,105 @@ def test_convert_device_map_stores_a_tilted_rectangle_the_way_it_renders():
     assert len({round(y, 3) for _, y in area.path}) == 2
     assert sorted(rendered) == sorted((round(x * 10), round(y * 10)) for x, y in corners)
 
+
+
+# ---------------------------------------------------------------------------
+# assemble_vector_map: mowing trails per map
+# ---------------------------------------------------------------------------
+
+def _map_with_box(map_id: int, x1: int, x2: int) -> MowerVectorMap:
+    """A map whose single zone is the rectangle x1..x2 by -1000..1000."""
+    vmap = MowerVectorMap(map_id=map_id, map_index=map_id - 1)
+    vmap.zones = [MowerZone(zone_id=1, path=[(x1, -1000), (x2, -1000), (x2, 1000), (x1, 1000)])]
+    return vmap
+
+
+def test_assemble_keeps_each_maps_own_mowing_trails():
+    """The maps share one coordinate system; each keeps the trails within it."""
+    first = _map_with_box(1, -40000, 20000)
+    second = _map_with_box(2, -130000, -35000)
+    on_first = [(0, 0), (10000, 0), (10000, 500)]
+    on_second = [(-120000, 0), (-90000, 0), (-90000, 500)]
+    trails = [MowerMowPath(zone_id=0, segments=[on_second, on_first])]
+
+    assemble_vector_map([first, second], trails)
+
+    assert first.mow_paths == [MowerMowPath(zone_id=0, segments=[on_first])]
+    assert second.mow_paths == [MowerMowPath(zone_id=0, segments=[on_second])]
+
+
+def test_assemble_keeps_all_trails_on_a_single_map():
+    """With a single map, every trail is its own."""
+    only = _map_with_box(1, -400, 200)
+    trails = [MowerMowPath(zone_id=0, segments=[[(-1200, 0), (-900, 0)]])]
+
+    assemble_vector_map([only], trails)
+
+    assert only.mow_paths == trails
+
+
+def test_assemble_keeps_the_edge_pass_just_outside_a_zone():
+    """The edge-mowing pass runs along the boundary, partly just outside it."""
+    first = _map_with_box(1, 0, 10000)
+    second = _map_with_box(2, -30000, -20000)
+    edge = [(x, 1500) for x in range(0, 10000, 1000)]  # 500 outside the top edge
+    trails = [MowerMowPath(zone_id=0, segments=[edge])]
+
+    assemble_vector_map([first, second], trails)
+
+    assert first.mow_paths == trails
+    assert second.mow_paths == []
+
+
+def test_assemble_cuts_a_trail_where_it_leaves_the_map():
+    """The drive from one map to the other is not drawn on either."""
+    first = _map_with_box(1, 0, 10000)
+    second = _map_with_box(2, -30000, -20000)
+    inside = [(x, 0) for x in range(1000, 9000, 1000)]
+    drive = [(5000, y) for y in range(5000, 20000, 5000)]  # leaves the map
+    trails = [MowerMowPath(zone_id=0, segments=[inside + drive])]
+
+    assemble_vector_map([first, second], trails)
+
+    assert first.mow_paths == [MowerMowPath(zone_id=0, segments=[inside])]
+
+
+# ---------------------------------------------------------------------------
+# outline_matches_zones
+# ---------------------------------------------------------------------------
+
+_SQUARE = [(0, 0), (40000, 0), (40000, 40000), (0, 40000)]
+
+
+def _outline(points, step=1000):
+    """Densify a closed polygon into an outline with a point every step."""
+    out = []
+    for (ax, ay), (bx, by) in zip(points, points[1:] + points[:1]):
+        n = max(abs(bx - ax), abs(by - ay)) // step
+        out.extend((ax + (bx - ax) * i // n, ay + (by - ay) * i // n) for i in range(n))
+    return out
+
+
+def test_outline_of_the_same_map_matches():
+    """The outline recorded in a mission matches the map it was mowed on."""
+    zones = [MowerZone(zone_id=1, path=_SQUARE)]
+    assert outline_matches_zones([_outline(_SQUARE)], zones) is True
+
+
+def test_outline_of_a_neighbouring_map_does_not_match():
+    """A map that only touches the active one is not taken for it."""
+    neighbour = [(40000, 0), (90000, 0), (90000, 40000), (40000, 40000)]
+    zones = [MowerZone(zone_id=1, path=_SQUARE)]
+    assert outline_matches_zones([_outline(neighbour)], zones) is False
+
+
+def test_outline_of_part_of_the_map_does_not_match():
+    """An outline covering only part of the map is not its outline."""
+    part = [(0, 0), (40000, 0), (40000, 10000), (0, 10000)]
+    zones = [MowerZone(zone_id=1, path=_SQUARE)]
+    assert outline_matches_zones([_outline(part)], zones) is False
+
+
+def test_no_outline_does_not_match():
+    """A mission without an outline belongs to no map."""
+    assert outline_matches_zones([], [MowerZone(zone_id=1, path=_SQUARE)]) is False

@@ -779,6 +779,135 @@ def has_map(vmap: MowerVectorMap) -> bool:
     return vmap.md5sum != "" or bool(vmap.zones)
 
 
+# How far outside its zones a trail point still counts as on the map, in map
+# units (mm): the edge-mowing pass runs along the boundary, partly outside it.
+_TRAIL_EDGE_TOLERANCE = 1000
+
+
+def _inside_polygon(point: tuple[int, int], polygon: list[tuple[int, int]]) -> bool:
+    """Return whether a point lies inside a polygon (even-odd rule)."""
+    x, y = point
+    inside = False
+    j = len(polygon) - 1
+    for i in range(len(polygon)):
+        xi, yi = polygon[i]
+        xj, yj = polygon[j]
+        if (yi > y) != (yj > y) and x < (xj - xi) * (y - yi) / (yj - yi) + xi:
+            inside = not inside
+        j = i
+    return inside
+
+
+def _near_polygon(point: tuple[int, int], polygon: list[tuple[int, int]], tolerance: float) -> bool:
+    """Return whether a point lies within tolerance of a polygon's outline."""
+    px, py = point
+    limit = tolerance * tolerance
+    j = len(polygon) - 1
+    for i in range(len(polygon)):
+        ax, ay = polygon[j]
+        bx, by = polygon[i]
+        dx, dy = bx - ax, by - ay
+        length = dx * dx + dy * dy
+        t = 0.0 if length == 0 else max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / length))
+        cx, cy = ax + t * dx - px, ay + t * dy - py
+        if cx * cx + cy * cy <= limit:
+            return True
+        j = i
+    return False
+
+
+def _mow_paths_on_map(mow_paths: list[MowerMowPath], vmap: MowerVectorMap) -> list[MowerMowPath]:
+    """Keep the mowing trails that run on one map.
+
+    The maps of a mower share one coordinate system, and M_PATH holds the
+    trails of all of them, so each map keeps the segments that run mostly
+    within its zones, cut to the part within them. A map without zones keeps
+    them all.
+    """
+    polygons = [zone.path for zone in vmap.zones if len(zone.path) >= 3]
+    if not polygons:
+        return mow_paths
+
+    boxes = [
+        (
+            min(x for x, _ in polygon) - _TRAIL_EDGE_TOLERANCE,
+            max(x for x, _ in polygon) + _TRAIL_EDGE_TOLERANCE,
+            min(y for _, y in polygon) - _TRAIL_EDGE_TOLERANCE,
+            max(y for _, y in polygon) + _TRAIL_EDGE_TOLERANCE,
+        )
+        for polygon in polygons
+    ]
+
+    def on_map(point: tuple[int, int]) -> bool:
+        for polygon, (x_min, x_max, y_min, y_max) in zip(polygons, boxes):
+            if not (x_min <= point[0] <= x_max and y_min <= point[1] <= y_max):
+                continue
+            if _inside_polygon(point, polygon) or _near_polygon(point, polygon, _TRAIL_EDGE_TOLERANCE):
+                return True
+        return False
+
+    kept: list[MowerMowPath] = []
+    for path in mow_paths:
+        segments: list[list[tuple[int, int]]] = []
+        for segment in path.segments:
+            flags = [on_map(point) for point in segment]
+            if 2 * sum(flags) <= len(segment):
+                continue  # a trail of another map
+            # Cut the trail where it leaves the map, such as the drive to another map.
+            run: list[tuple[int, int]] = []
+            for point, flag in zip(segment, flags):
+                if flag:
+                    run.append(point)
+                    continue
+                if len(run) > 1:
+                    segments.append(run)
+                run = []
+            if len(run) > 1:
+                segments.append(run)
+        if segments:
+            kept.append(MowerMowPath(zone_id=path.zone_id, segments=segments))
+    return kept
+
+
+# Share of points that must lie on the other outline for two outlines to be
+# taken as the same map
+_OUTLINE_MATCH_SHARE = 0.9
+# Points sampled from each outline when comparing them
+_OUTLINE_SAMPLE_POINTS = 200
+
+
+def _sample(points: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Return at most _OUTLINE_SAMPLE_POINTS points, evenly spread."""
+    step = max(1, len(points) // _OUTLINE_SAMPLE_POINTS)
+    return points[::step]
+
+
+def outline_matches_zones(outlines: list[list[tuple[int, int]]], zones: list[MowerZone]) -> bool:
+    """Return whether zone outlines recorded elsewhere are those of these zones.
+
+    Both ways round, nearly every point of one outline has to lie on the
+    other, within the edge tolerance. One outline covering only part of the
+    other, or two maps that merely touch, does not match.
+    """
+    polygons = [list(zone.path) for zone in zones if len(zone.path) >= 3]
+    rings = [outline for outline in outlines if len(outline) >= 3]
+    if not polygons or not rings:
+        return False
+
+    def share_near(points: list[tuple[int, int]], shapes: list[list[tuple[int, int]]]) -> float:
+        sample = _sample(points)
+        near = sum(
+            any(_near_polygon(point, shape, _TRAIL_EDGE_TOLERANCE) for shape in shapes)
+            for point in sample
+        )
+        return near / len(sample)
+
+    return (
+        share_near([p for ring in rings for p in ring], polygons) >= _OUTLINE_MATCH_SHARE
+        and share_near([p for polygon in polygons for p in polygon], rings) >= _OUTLINE_MATCH_SHARE
+    )
+
+
 def assemble_vector_map(
     parsed_maps: list[MowerVectorMap],
     mow_paths: list[MowerMowPath],
@@ -807,7 +936,7 @@ def assemble_vector_map(
     parsed_maps_by_id = {vmap.map_id: vmap for vmap in ordered_maps}
     for vmap in ordered_maps:
         vmap.available_maps = available_maps
-        vmap.mow_paths = mow_paths
+        vmap.mow_paths = mow_paths if len(ordered_maps) == 1 else _mow_paths_on_map(mow_paths, vmap)
 
     primary_map.maps = parsed_maps_by_id
     return primary_map
