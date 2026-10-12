@@ -120,6 +120,30 @@ def coord_to_pixel(x: int, y: int, bounds: Tuple[int, int, int, int],
     return pixel_x, pixel_y
 
 
+# Room kept below the map for the timestamp line, in pixels
+_FOOTER_HEIGHT = 30
+# Shortest side of a canvas fitted to a long, narrow map, in pixels
+_MIN_CANVAS_SIDE = 300
+
+
+def fit_canvas(bounds: Tuple[int, int, int, int], padding: int = MAP_PADDING) -> Tuple[int, int]:
+    """Return a canvas with the map's proportions, its long side the default size.
+
+    A square canvas left wide bands of empty space around a long map, which a
+    card cropping to its own proportions then cut into.
+    """
+    min_x, min_y, max_x, max_y = bounds
+    coord_width = max(max_x - min_x, 100)
+    coord_height = max(max_y - min_y, 100)
+    if coord_width >= coord_height:
+        width = MAP_IMAGE_WIDTH
+        height = round((width - 2 * padding) * coord_height / coord_width) + 2 * padding + _FOOTER_HEIGHT
+    else:
+        height = MAP_IMAGE_HEIGHT
+        width = round((height - 2 * padding - _FOOTER_HEIGHT) * coord_width / coord_height) + 2 * padding
+    return max(width, _MIN_CANVAS_SIDE), max(height, _MIN_CANVAS_SIDE)
+
+
 def _split_segments(points: List[List[int]]) -> List[List[List[int]]]:
     """Split a point list on the segment break marker into its segments."""
     segments: List[List[List[int]]] = []
@@ -307,7 +331,7 @@ def _scale_map_data(data: Dict[str, Any], factor: int = 10) -> Dict[str, Any]:
 def generate_svg_map_image(data: Dict[str, Any], historical_file_path: str | None, coordinator, rotation: int,
                            live_coordinates: List[List[int]] | None = None,
                            show_title: bool = True, show_legend: bool = True,
-                           padding: int = MAP_PADDING) -> bytes:
+                           padding: int = MAP_PADDING, fit: bool = False) -> bytes:
     """Generate map image in SVG format from map data.
 
     Args:
@@ -319,6 +343,7 @@ def generate_svg_map_image(data: Dict[str, Any], historical_file_path: str | Non
         show_title: Whether to render the map title text
         show_legend: Whether to render the color legend
         padding: Padding around the map content in pixels (default: 50)
+        fit: Give the canvas the map's proportions instead of a square
     """
 
     # Historical files use decimeter coordinates; scale to centimeters to match
@@ -326,8 +351,10 @@ def generate_svg_map_image(data: Dict[str, Any], historical_file_path: str | Non
     if historical_file_path:
         data = _scale_map_data(data)
     
-    # Create SVG document with off-white background
-    svg_lines = create_svg_document(MAP_IMAGE_WIDTH, MAP_IMAGE_HEIGHT, '#f5f5f0')
+    # Create SVG document with off-white background. The canvas is square until
+    # the map's extent is known, then takes on the map's proportions.
+    width, height = MAP_IMAGE_WIDTH, MAP_IMAGE_HEIGHT
+    svg_lines = create_svg_document(width, height, '#f5f5f0')
 
     try:
         # Collect all coordinate points for bounds calculation
@@ -414,35 +441,40 @@ def generate_svg_map_image(data: Dict[str, Any], historical_file_path: str | Non
             all_points.extend(live_coordinates)
 
         if not all_points:
-            svg_lines.append(f'<text x="{MAP_IMAGE_WIDTH // 2}" y="{MAP_IMAGE_HEIGHT // 2}" font-family="Arial, sans-serif" font-size="16" fill="{COLORS_SVG["text_color"]}" text-anchor="middle">No map data available</text>')
+            svg_lines.append(f'<text x="{width // 2}" y="{height // 2}" font-family="Arial, sans-serif" font-size="16" fill="{COLORS_SVG["text_color"]}" text-anchor="middle">No map data available</text>')
         else:
             bounds = calculate_bounds(all_points)
+            if fit and rotation in (0, 180):
+                width, height = fit_canvas(bounds, padding)
 
             # Start rotation group if rotation is specified
             if rotation in [90, 180, 270]:
-                center_x = MAP_IMAGE_WIDTH // 2
-                center_y = MAP_IMAGE_HEIGHT // 2
+                center_x = width // 2
+                center_y = height // 2
                 svg_lines.append(f'<g transform="rotate({rotation}, {center_x}, {center_y})">')
 
             # 0. Draw inter-zone connection paths (type=1) as dashed grey — behind zone fills
-            multi_zone = len(zone_data) > 1
             for i, (z_segs, _z_tracks, _z_name, z_type) in enumerate(zone_data):
                 if z_type != 1:
                     continue
                 for seg in z_segs:
                     if len(seg) >= 2:
-                        dashed = svg_dashed_path(seg, bounds, MAP_IMAGE_WIDTH, MAP_IMAGE_HEIGHT, '#b4b4b4', 3, padding=padding)
+                        dashed = svg_dashed_path(seg, bounds, width, height, '#b4b4b4', 3, padding=padding)
                         if dashed:
                             svg_lines.append(dashed)
 
-            # 1. Draw zone fills — only for type=0 (actual mowing zones)
+            # 1. Draw zone fills — only for type=0 (actual mowing zones). Every
+            #    mowing zone is filled, a map's only zone included, each in the
+            #    next colour; the inter-zone paths take no colour of their own.
+            mowing_zones = [i for i, (_s, _t, _n, z_type) in enumerate(zone_data) if z_type == 0]
+            zone_colors = {i: ZONE_COLORS[n % len(ZONE_COLORS)] for n, i in enumerate(mowing_zones)}
             for i, (z_segs, _z_tracks, _z_name, z_type) in enumerate(zone_data):
-                if not z_segs or not multi_zone or z_type != 0:
+                if not z_segs or z_type != 0:
                     continue
-                fill_color, outline_color = ZONE_COLORS[i % len(ZONE_COLORS)]
+                fill_color, outline_color = zone_colors[i]
                 for seg in z_segs:
                     if len(seg) >= 3:
-                        poly = svg_polygon(seg, bounds, MAP_IMAGE_WIDTH, MAP_IMAGE_HEIGHT,
+                        poly = svg_polygon(seg, bounds, width, height,
                                            fill_color, outline_color, padding=padding)
                         if poly:
                             svg_lines.append(poly)
@@ -450,8 +482,8 @@ def generate_svg_map_image(data: Dict[str, Any], historical_file_path: str | Non
             # 2. Draw zone boundary outlines (skip type=1 inter-zone paths)
             for i, (z_segs, _z_tracks, _z_name, z_type) in enumerate(zone_data):
                 if z_segs and z_type == 0:
-                    color = ZONE_COLORS[i % len(ZONE_COLORS)][1] if multi_zone else COLORS_SVG['map_boundary']
-                    boundary_path = svg_path_from_segments(z_segs, bounds, MAP_IMAGE_WIDTH, MAP_IMAGE_HEIGHT, color, 2, padding=padding)
+                    color = zone_colors[i][1]
+                    boundary_path = svg_path_from_segments(z_segs, bounds, width, height, color, 2, padding=padding)
                     if boundary_path:
                         svg_lines.append(boundary_path)
 
@@ -463,13 +495,13 @@ def generate_svg_map_image(data: Dict[str, Any], historical_file_path: str | Non
                 for n, track in enumerate(session_tracks):
                     color = SESSION_COLORS[(len(session_tracks) - 1 - n) % len(SESSION_COLORS)]
                     session_path = svg_path_from_segments(
-                        _split_segments(track), bounds, MAP_IMAGE_WIDTH, MAP_IMAGE_HEIGHT, color, 2, padding=padding)
+                        _split_segments(track), bounds, width, height, color, 2, padding=padding)
                     if session_path:
                         svg_lines.append(session_path)
             elif not live_coordinates:
                 for i, (_z_segs, z_tracks, _z_name, z_type) in enumerate(zone_data):
                     if z_tracks and z_type == 0:
-                        track_path = svg_path_from_segments(z_tracks, bounds, MAP_IMAGE_WIDTH, MAP_IMAGE_HEIGHT, COLORS_SVG['mowing_path'], 2, padding=padding)
+                        track_path = svg_path_from_segments(z_tracks, bounds, width, height, COLORS_SVG['mowing_path'], 2, padding=padding)
                         if track_path:
                             svg_lines.append(track_path)
 
@@ -477,7 +509,7 @@ def generate_svg_map_image(data: Dict[str, Any], historical_file_path: str | Non
             for obstacle in obstacles:
                 obstacle_data = obstacle.get("data", [])
                 if obstacle_data:
-                    obstacle_polygon = svg_polygon(obstacle_data, bounds, MAP_IMAGE_WIDTH, MAP_IMAGE_HEIGHT,
+                    obstacle_polygon = svg_polygon(obstacle_data, bounds, width, height,
                                                  COLORS_SVG['obstacle_fill'], COLORS_SVG['obstacle'], padding=padding)
                     if obstacle_polygon:
                         svg_lines.append(obstacle_polygon)
@@ -492,7 +524,7 @@ def generate_svg_map_image(data: Dict[str, Any], historical_file_path: str | Non
                     continue
                 cx = sum(p[0] for p in all_zone_pts) // len(all_zone_pts)
                 cy = sum(p[1] for p in all_zone_pts) // len(all_zone_pts)
-                px, py = coord_to_pixel(cx, cy, bounds, MAP_IMAGE_WIDTH, MAP_IMAGE_HEIGHT, padding)
+                px, py = coord_to_pixel(cx, cy, bounds, width, height, padding)
                 svg_lines.append(
                     f'<text x="{px}" y="{py}" font-family="Arial, sans-serif" font-size="14" '
                     f'fill="{ZONE_LABEL_COLOR}" text-anchor="middle" dominant-baseline="central">'
@@ -502,7 +534,7 @@ def generate_svg_map_image(data: Dict[str, Any], historical_file_path: str | Non
             # 7. Draw current mower position (only when not in live mode)
             if mower_position and not live_coordinates:
                 mower_circle = svg_circle(mower_position[0], mower_position[1], bounds,
-                                        MAP_IMAGE_WIDTH, MAP_IMAGE_HEIGHT, 6,
+                                        width, height, 6,
                                         COLORS_SVG['current_position'], COLORS_SVG['text_color'], padding=padding)
                 svg_lines.append(mower_circle)
 
@@ -511,23 +543,23 @@ def generate_svg_map_image(data: Dict[str, Any], historical_file_path: str | Non
                 # Filter out sentinel break markers for rendering
                 valid_live = [p for p in live_coordinates if p[0] != 2147483647 and p[1] != 2147483647]
                 if len(valid_live) > 1:
-                    live_path = svg_path_from_segments([valid_live], bounds, MAP_IMAGE_WIDTH, MAP_IMAGE_HEIGHT,
+                    live_path = svg_path_from_segments([valid_live], bounds, width, height,
                                                       COLORS_SVG['live_path'], 4, padding=padding)
                     if live_path:
                         svg_lines.append(live_path)
 
                     # Start position
                     svg_lines.append(svg_circle(valid_live[0][0], valid_live[0][1], bounds,
-                                               MAP_IMAGE_WIDTH, MAP_IMAGE_HEIGHT, 6,
+                                               width, height, 6,
                                                COLORS_SVG['start_position'], COLORS_SVG['text_color'], padding=padding))
                     # Current position
                     svg_lines.append(svg_circle(valid_live[-1][0], valid_live[-1][1], bounds,
-                                               MAP_IMAGE_WIDTH, MAP_IMAGE_HEIGHT, 8,
+                                               width, height, 8,
                                                COLORS_SVG['current_position'], '#8b0000', padding=padding))
 
                 elif len(valid_live) == 1:
                     svg_lines.append(svg_circle(valid_live[0][0], valid_live[0][1], bounds,
-                                               MAP_IMAGE_WIDTH, MAP_IMAGE_HEIGHT, 8,
+                                               width, height, 8,
                                                COLORS_SVG['current_position'], '#8b0000', padding=padding))
 
             # Close rotation group if it was opened
@@ -549,7 +581,7 @@ def generate_svg_map_image(data: Dict[str, Any], historical_file_path: str | Non
                 title_color = COLORS_SVG['text_color']
                 title_size = 16
 
-            svg_lines.append(f'<text x="{MAP_IMAGE_WIDTH // 2}" y="30" font-family="Arial, sans-serif" font-size="{title_size}" font-weight="bold" fill="{title_color}" text-anchor="middle">{title}</text>')
+            svg_lines.append(f'<text x="{width // 2}" y="30" font-family="Arial, sans-serif" font-size="{title_size}" font-weight="bold" fill="{title_color}" text-anchor="middle">{title}</text>')
 
         # Add legend in top left
         if show_legend:
@@ -557,10 +589,7 @@ def generate_svg_map_image(data: Dict[str, Any], historical_file_path: str | Non
             legend_y = 50
             legend_items = []
 
-            has_segments = any(z_segs for z_segs, _, _, _ in zone_data)
             has_tracks = any(z_tracks for _, z_tracks, _, _ in zone_data)
-            if has_segments and not multi_zone:
-                legend_items.append(("Map Boundary", COLORS_SVG['map_boundary']))
             if session_tracks and not live_coordinates:
                 starts = data.get("session_starts") or []
                 for n in range(len(session_tracks)):
@@ -622,7 +651,7 @@ def generate_svg_map_image(data: Dict[str, Any], historical_file_path: str | Non
             ]
             filtered_lines = [line for line in status_lines if line.strip()]
             status_text = "\n".join(filtered_lines)
-            status_bg = svg_text_with_background(status_text, 10, MAP_IMAGE_HEIGHT - 80, 10,
+            status_bg = svg_text_with_background(status_text, 10, height - 80, 10,
                                                  COLORS_SVG['text_color'], COLORS_SVG['text_bg'])
             svg_lines.append(status_bg)
         else:
@@ -633,7 +662,7 @@ def generate_svg_map_image(data: Dict[str, Any], historical_file_path: str | Non
                 timestamp_text = f"Started: {timestamp}"
             else:
                 timestamp_text = "No time information"
-            timestamp_bg = svg_text_with_background(timestamp_text, 10, MAP_IMAGE_HEIGHT - 25, 10,
+            timestamp_bg = svg_text_with_background(timestamp_text, 10, height - 25, 10,
                                                   COLORS_SVG['text_color'], '#f5f5f0', 3)
             svg_lines.append(timestamp_bg)
 
@@ -641,7 +670,9 @@ def generate_svg_map_image(data: Dict[str, Any], historical_file_path: str | Non
         # Create error message
         _LOGGER.error("Error generating map SVG: %s", ex, exc_info=True)
         error_text = f"Error generating map: {str(ex)}"
-        svg_lines.append(f'<text x="{MAP_IMAGE_WIDTH // 2}" y="{MAP_IMAGE_HEIGHT // 2}" font-family="Arial, sans-serif" font-size="14" fill="{COLORS_SVG["current_position"]}" text-anchor="middle">{error_text}</text>')
+        svg_lines.append(f'<text x="{width // 2}" y="{height // 2}" font-family="Arial, sans-serif" font-size="14" fill="{COLORS_SVG["current_position"]}" text-anchor="middle">{error_text}</text>')
+
+    svg_lines[1] = create_svg_document(width, height)[1]
 
     # Complete SVG document and return as bytes
     svg_content = finish_svg_document(svg_lines)

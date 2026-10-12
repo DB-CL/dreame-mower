@@ -61,7 +61,8 @@
           "map_rotation": "Térkép elforgatása",
           "map_show_title": "Térképcím megjelenítése",
           "map_show_legend": "Térképjelmagyarázat megjelenítése",
-          "map_padding": "Térkép kitöltés (képpont)"
+          "map_padding": "Térkép kitöltés (képpont)",
+          "map_fit": "Kép igazítása a térkép alakjához"
         }
       }
     }
