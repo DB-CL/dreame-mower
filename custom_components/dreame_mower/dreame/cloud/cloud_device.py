@@ -164,7 +164,9 @@ class DreameMowerCloudDevice:
         if rc == 0:
             return
 
-        _LOGGER.warning("Unexpected MQTT disconnect rc=%s", rc)
+        # Logged at debug: a quick reconnect is routine, and a lasting drop is
+        # reported by the device once its grace period runs out.
+        _LOGGER.debug("Unexpected MQTT disconnect rc=%s", rc)
 
         # Attempt to refresh credentials if auth related
         if not self._refresh_mqtt_credentials():
@@ -480,6 +482,28 @@ class DreameMowerCloudDevice:
         if api_response is None or "data" not in api_response:
             return None
         return api_response["data"]
+
+    def manual_firmware_update(self) -> Any:
+        """Ask the cloud OTA service to push the latest firmware to the device.
+
+        POSTs to iotuserbind/manualFirmwareUpdate and returns the whole response,
+        whose ``code`` is 0 when the service accepted the request. The device then
+        downloads and installs the firmware on its own, reporting its progress on
+        the 1:2 and 1:3 properties.
+        """
+        if not self._cloud_base.connected:
+            _LOGGER.info("manual_firmware_update: Not connected. Attempting to connect.")
+            self._cloud_base.connect()
+
+        if not self._cloud_base.connected:
+            raise ConnectionError("manual_firmware_update: Unable to connect. Connection failed.")
+
+        # Never retried: a repeated request must not start a second update.
+        return self._cloud_base._api_call(
+            f"{self._cloud_base._api_strings[23]}/{self._cloud_base._api_strings[24]}/manualFirmwareUpdate",
+            {"did": self._device_id},
+            retry_count=0,
+        )
 
     def set_batch_device_datas(self, props) -> Any:
         if not self._cloud_base.connected:

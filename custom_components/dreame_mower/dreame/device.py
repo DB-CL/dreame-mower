@@ -11,17 +11,29 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 from collections.abc import Iterable, Mapping, Sequence
 from copy import deepcopy
 from enum import Enum
 import json
 import logging
 import os
+import threading
+import time
 from typing import Any, Callable
 from datetime import datetime
 
 from .cloud.cloud_device import DreameMowerCloudDevice
-from .map_data_parser import MowerVectorMap, parse_batch_map_data
+from .map_data_parser import (
+    MowerVectorMap,
+    assemble_vector_map,
+    convert_device_map,
+    has_map,
+    parse_batch_map_data,
+    parse_cached_maps,
+    parse_mow_paths,
+    parse_mower_map,
+)
 from .utils import download_file
 from .property import (
     MiscPropertyHandler,
@@ -69,6 +81,9 @@ from .const import (
     CHARGING_STATUS_MAPPING,
     TASK_STATUS_PROPERTY,
     FIRMWARE_INSTALL_STATE_MAPPING,
+    FIRMWARE_UPDATE_ALLOWED_STATUSES,
+    FIRMWARE_UPDATE_MIN_BATTERY_PERCENT,
+    FirmwareInstallState,
     SERVICE5_PROPERTY_100,
     SERVICE5_PROPERTY_101,
     SERVICE5_PROPERTY_105,
@@ -90,6 +105,7 @@ from .const import (
     DEVICE_CODE_PROPERTY,
     PROPERTY_1_1,
     ONLINE_OFFLINE_DEBOUNCE_POLLS,
+    TRANSPORT_DISCONNECT_GRACE_SECONDS,
     CURRENT_MAP_ID_PROPERTY_NAME,
     CUTTING_HEIGHT_ABSOLUTE_MAX_CM,
     CUTTING_HEIGHT_MIN_CM,
@@ -140,15 +156,37 @@ from .const import (
     DEVICE_SETTINGS_BATTERY_KEY,
     DEVICE_SETTINGS_RAIN_KEY,
     SCHEDULE_CHUNK_SIZE,
+    MAP_LIST_KEY,
+    MAP_INFO_KEY,
+    MAP_DATA_KEY,
+    MAP_CHUNK_SIZE,
     SCHEDULE_DATA_KEY,
     SCHEDULE_ENABLE_KEY,
     SCHEDULE_INFO_KEY,
+    SCHEDULE_MOVA_DATA_KEY,
+    SCHEDULE_MOVA_ENABLE_KEY,
+    SCHEDULE_MOVA_INFO_KEY,
     SCHEDULE_PLAN_ENABLED_INDEX,
     SCHEDULE_PLAN_NAME_INDEX,
     SCHEDULE_PLAN_SLOT_INDEX,
     SCHEDULE_PLAN_TASKS_INDEX,
     SCHEDULE_STATUS_SUCCESS,
     SCHEDULE_STATUS_VERSION_ERROR,
+    SCHEDULE_SLOT_COUNT,
+    SCHEDULE_TABLE_CYCLIC_TYPE_OFFSET,
+    SCHEDULE_TABLE_ENABLE_KEY,
+    SCHEDULE_TABLE_ENABLED_INDEX,
+    SCHEDULE_TABLE_ID_INDEX,
+    SCHEDULE_TABLE_INFO_KEY,
+    SCHEDULE_TABLE_NAME_INDEX,
+    SCHEDULE_TABLE_TASK_DAYS_INDEX,
+    SCHEDULE_TABLE_TASK_ENABLED_INDEX,
+    SCHEDULE_TABLE_TASK_KEY,
+    SCHEDULE_TABLE_UNSUPPORTED_REPLY,
+    SCHEDULE_TABLE_TASK_REGIONS_INDEX,
+    SCHEDULE_TABLE_TASK_START_INDEX,
+    SCHEDULE_TABLE_TASK_TYPE_INDEX,
+    SCHEDULE_TABLE_TASKS_INDEX,
     SCHEDULE_TASK_MINIMUM_LENGTH,
     SCHEDULE_TASK_START_MARKER,
     SCHEDULE_TASK_TYPE_MAPPING,
@@ -262,6 +300,9 @@ class DreameMowerDevice:
         self._username = username
         self._password = password
         self._account_type = account_type
+        # Set once a MOVA mower turns the table read down, after which its
+        # schedules are read as a document for the rest of the session.
+        self._schedule_tables_unsupported = False
         self._country = country
         self._hass_config_dir = hass_config_dir
         
@@ -289,6 +330,11 @@ class DreameMowerDevice:
         # Consecutive offline heartbeat polls seen so far; the device is only
         # flipped offline once this reaches ONLINE_OFFLINE_DEBOUNCE_POLLS.
         self._offline_poll_count = 0
+        # Monotonic time the transport dropped while we were connected, or None.
+        # While set and within TRANSPORT_DISCONNECT_GRACE_SECONDS the device is
+        # still reported connected, so a quick broker reconnect does not flap.
+        self._transport_down_since: float | None = None
+        self._transport_grace_timer: threading.Timer | None = None
 
         # MQTT properties
         self._bluetooth_connected: bool | None = None
@@ -300,6 +346,10 @@ class DreameMowerDevice:
         self._firmware_download_progress: int | None = None
         self._firmware_new_available: bool = False
         self._firmware_latest_version: str | None = None
+        self._firmware_release_notes: str | None = None
+        # Whether the cloud OTA service has answered a version check yet; until
+        # it has, the latest firmware version is not known either way.
+        self._firmware_status_checked: bool = False
         self._service1_property_50: bool = False
         self._service1_property_51: bool = False
         self._service1_completion_flag: bool = False
@@ -313,9 +363,15 @@ class DreameMowerDevice:
         self._mission_completion_handler = MissionCompletionEventHandler()
         self._pose_coverage_handler = PoseCoveragePropertyHandler()
         
-        # Vector map from batch API
+        # Vector map, read from the mower and the cloud copy of its maps
         self._vector_map: MowerVectorMap | None = None
         self._current_map_id: int | None = None
+        # Hash of every map slot that holds a map, as of the last map read; None
+        # while the maps have not been read from the mower itself.
+        self._map_hashes: dict[int, str] | None = None
+        # A map data read continues whichever map the info read before it named,
+        # so two map reads must not interleave.
+        self._map_read_lock = threading.Lock()
 
         # Mowing settings of the current map, alongside the mode that decides
         # which of them the mower applies. Read on demand from the mowing
@@ -334,6 +390,10 @@ class DreameMowerDevice:
         self._schedules: list[dict[str, Any]] | None = None
         self._schedule_map_index: int | None = None
         self._schedule_version: int | None = None
+        # Decoded tasks of the schedule tables, by table and task id, alongside
+        # the version they were read at. The tables are numbered across maps, so
+        # the cache stays valid when the map changes.
+        self._schedule_table_tasks: dict[tuple[int, int], tuple[int, list[dict[str, Any]]]] = {}
 
         # Property change callbacks
         self._property_callbacks: list[Callable[[str, Any], None]] = []
@@ -343,8 +403,18 @@ class DreameMowerDevice:
 
     @property
     def connected(self) -> bool:
-        """Return True if device is connected."""
-        return self._cloud_device.connected
+        """Return True if device is connected.
+
+        A transport drop is only reported once it has outlasted
+        TRANSPORT_DISCONNECT_GRACE_SECONDS.
+        """
+        if self._cloud_device.connected:
+            return True
+        down_since = self._transport_down_since
+        return (
+            down_since is not None
+            and time.monotonic() - down_since < TRANSPORT_DISCONNECT_GRACE_SECONDS
+        )
 
     @property
     def device_reachable(self) -> bool:
@@ -425,6 +495,46 @@ class DreameMowerDevice:
     def firmware_latest_version(self) -> str | None:
         """Return the latest available firmware version, if any."""
         return self._firmware_latest_version
+
+    @property
+    def firmware_release_notes(self) -> str | None:
+        """Return the release notes of the available firmware, if any."""
+        return self._firmware_release_notes
+
+    @property
+    def firmware_status_checked(self) -> bool:
+        """Return whether the cloud has answered a firmware version check yet."""
+        return self._firmware_status_checked
+
+    @property
+    def firmware_update_in_progress(self) -> bool:
+        """Return whether the mower is downloading or installing a firmware update.
+
+        The mower reports the update on 1:2, and also shows it in its status
+        while installing. Download progress on 1:3 between 0 and 100 means an
+        update is under way even before 1:2 says so, unless 1:2 already reports
+        that the update ended.
+        """
+        if self._status_code == DeviceStatus.UPDATING:
+            return True
+        state = self._firmware_install_state
+        if state == FirmwareInstallState.UPGRADING:
+            return True
+        if state in (
+            FirmwareInstallState.UPGRADE_SUCCESS,
+            FirmwareInstallState.UPGRADE_FAILED,
+            FirmwareInstallState.CANNOT_UPGRADE,
+        ):
+            return False
+        progress = self._firmware_download_progress
+        return progress is not None and 0 < progress < 100
+
+    @property
+    def firmware_update_percentage(self) -> int | None:
+        """Return how far a running firmware update has come, in percent."""
+        if not self.firmware_update_in_progress:
+            return None
+        return self._firmware_download_progress
     
     @property
     def service1_property_50(self) -> bool:
@@ -574,12 +684,12 @@ class DreameMowerDevice:
 
     @property
     def vector_map(self) -> MowerVectorMap | None:
-        """Return the current vector map data from batch API."""
+        """Return the vector map of the current map."""
         return self._resolved_vector_map()
 
     @property
     def available_maps(self) -> list[dict[str, Any]]:
-        """Return map descriptors discovered in batch map data."""
+        """Return a descriptor for every map the mower holds."""
         if self._vector_map is None:
             return []
 
@@ -666,43 +776,254 @@ class DreameMowerDevice:
         return None
 
     def fetch_vector_map(self) -> bool:
-        """Fetch vector map data from the batch device data API.
+        """Read the mower's maps.
 
-        Requests all keys from the cloud batch API and parses
-        MAP.* and M_PATH.* into a MowerVectorMap.
+        The MAP.* keys of the batch device data hold a copy of the maps that is
+        only brought up to date from time to time, and keep a slot for every map
+        the mower can hold, whether it holds one or not. The mower itself reports
+        which slots hold a map and the hash of each, so a cached map is only used
+        while its hash still matches, and any other is read from the mower. When
+        the mower does not answer, the cached maps are used as they stand.
 
         Returns:
             True if map data was updated, False otherwise.
         """
-        try:
-            # Pass empty list to get all available keys (MAP.*, M_PATH.*, etc.)
-            # The API returns all keys when no specific keys are requested.
-            # M_PATH can have 28+ chunks depending on path history size.
-            batch_data = self._cloud_device.get_batch_device_datas([])
-            if not batch_data:
-                _LOGGER.debug("No batch data returned from cloud API")
+        with self._map_read_lock:
+            try:
+                updated = self._read_vector_map()
+            except Exception as ex:
+                _LOGGER.warning("Failed to fetch the vector map: %s", ex)
                 return False
 
-            vector_map = parse_batch_map_data(batch_data)
-            if vector_map is None:
-                _LOGGER.debug("Failed to parse batch map data")
-                return False
+        if not updated:
+            return False
 
-            self._vector_map = vector_map
-            self.refresh_current_map_id()
-            active_vector_map = self._resolved_vector_map() or vector_map
+        self.refresh_current_map_id()
+        active_vector_map = self._resolved_vector_map() or self._vector_map
+        if active_vector_map is not None:
             _LOGGER.debug(
                 "Vector map updated: %d zones, %d paths, boundary=%s",
                 len(active_vector_map.zones),
                 len(active_vector_map.paths),
                 active_vector_map.boundary,
             )
-            self._notify_property_change("vector_map_updated", True)
+        self._notify_property_change("vector_map_updated", True)
+        return True
+
+    def refresh_changed_vector_map(self) -> bool:
+        """Read the mower's maps back only when one of them changed.
+
+        The mower does not announce an edited map, so noticing one takes asking.
+        The hash of every map comes out of a single read each, and the maps are
+        only read back once one of the hashes, or the set of maps, moved.
+
+        Returns:
+            True if map data was read back and updated, False otherwise.
+        """
+        with self._map_read_lock:
+            try:
+                slots = self._read_map_slots()
+            except Exception as ex:
+                _LOGGER.debug("Failed to read the map hashes: %s", ex)
+                return False
+
+        if slots is None:
+            return False
+
+        if self._map_hashes is not None and {
+            slot["index"]: slot["hash"] for slot in slots
+        } == self._map_hashes:
+            return False
+
+        return self.fetch_vector_map()
+
+    def _read_vector_map(self) -> bool:
+        """Read the maps, preferring the mower's own over the cloud copy."""
+        batch_data = self._cloud_device.get_batch_device_datas([]) or {}
+        try:
+            slots = self._read_map_slots()
+        except Exception as ex:
+            _LOGGER.debug("Failed to read the map slots: %s", ex)
+            slots = None
+
+        if slots is None:
+            vector_map = parse_batch_map_data(batch_data)
+            if vector_map is None:
+                _LOGGER.debug("Failed to parse batch map data")
+                return False
+
+            self._vector_map = vector_map
             return True
 
-        except Exception as ex:
-            _LOGGER.warning("Failed to fetch vector map from batch API: %s", ex)
-            return False
+        cached_maps = {vmap.map_index: vmap for vmap in parse_cached_maps(batch_data)}
+        maps: list[MowerVectorMap] = []
+        hashes: dict[int, str] = {}
+        for slot in slots:
+            map_index = slot["index"]
+            cached = cached_maps.get(map_index)
+            vmap: MowerVectorMap
+            if cached is not None and cached.md5sum == slot["hash"]:
+                vmap = cached
+                hashes[map_index] = slot["hash"]
+            else:
+                fresh = self._read_device_map(map_index)
+                if fresh is not None:
+                    vmap = fresh
+                    hashes[map_index] = fresh.md5sum or slot["hash"]
+                elif cached is not None and has_map(cached):
+                    # A stale map still beats none. Its own hash is kept, so the
+                    # next check reads the map again.
+                    vmap = cached
+                    hashes[map_index] = cached.md5sum or ""
+                else:
+                    continue
+
+            if has_map(vmap):
+                maps.append(vmap)
+
+        vector_map = assemble_vector_map(maps, parse_mow_paths(batch_data))
+        if vector_map is None:
+            if slots:
+                _LOGGER.debug("None of the mower's maps could be read")
+                return False
+
+            # The mower holds no map at all, for instance once its last one was
+            # deleted, so none is offered any longer.
+            _LOGGER.debug("The mower reports no maps")
+
+        self._vector_map = vector_map
+        self._map_hashes = hashes
+        return True
+
+    def _read_device_map(self, map_index: int) -> MowerVectorMap | None:
+        """Read one map from the mower and parse it, or None when that fails."""
+        read = self._read_map_document(map_index)
+        if read is None:
+            return None
+
+        document, md5sum = read
+        try:
+            return parse_mower_map(convert_device_map(document, map_index, md5sum))
+        except (KeyError, TypeError, ValueError, IndexError) as ex:
+            _LOGGER.warning("Map index %s could not be parsed: %s", map_index, ex)
+            return None
+
+    def _read_map_slots(self) -> list[dict[str, Any]] | None:
+        """Read the map slots that hold a map, with the hash of each.
+
+        Returns None when the mower does not report its map slots.
+        """
+        result = self._cloud_device.action(
+            SCHEDULING_TASK_PROPERTY.siid,
+            SCHEDULING_TASK_PROPERTY.piid,
+            [self._build_get_map_list_payload()],
+        )
+        status, rows = self._preference_response(result)
+        if status not in (None, 0) or not isinstance(rows, list):
+            _LOGGER.debug("Map list read returned no map slots: %s", result)
+            return None
+
+        slots: list[dict[str, Any]] = []
+        for row in rows:
+            # A slot row is [index, is current, holds a map, has a backup, ...].
+            if not isinstance(row, (list, tuple)) or len(row) < 3:
+                continue
+
+            try:
+                map_index = int(row[0])
+            except (TypeError, ValueError):
+                continue
+
+            if not row[2]:
+                continue
+
+            info = self._read_map_info(map_index)
+            if info is None:
+                return None
+
+            slots.append({"index": map_index, "hash": info[0]})
+
+        return slots
+
+    def _read_map_info(self, map_index: int) -> tuple[str, int] | None:
+        """Read the hash and byte length of one map.
+
+        Naming the map is also what the data reads that follow continue from.
+        """
+        result = self._cloud_device.action(
+            SCHEDULING_TASK_PROPERTY.siid,
+            SCHEDULING_TASK_PROPERTY.piid,
+            [self._build_get_map_info_payload(map_index)],
+        )
+        status, data = self._preference_response(result)
+        if status not in (None, 0) or not isinstance(data, dict):
+            _LOGGER.debug("Failed to read the info of map index %s: %s", map_index, result)
+            return None
+
+        try:
+            return str(data["hash"]), int(data["size"])
+        except (KeyError, TypeError, ValueError):
+            _LOGGER.debug("Info of map index %s carries no hash and size: %s", map_index, data)
+            return None
+
+    def _read_map_document(self, map_index: int) -> tuple[dict[str, Any], str] | None:
+        """Read one map document from the mower, alongside the hash it is held under.
+
+        The mower counts the document in bytes, so the chunks are put back
+        together as bytes and only read as text once the whole document is in.
+        """
+        info = self._read_map_info(map_index)
+        if info is None:
+            return None
+
+        md5sum, length = info
+        chunks: list[bytes] = []
+        offset = 0
+        while offset < length:
+            result = self._cloud_device.action(
+                SCHEDULING_TASK_PROPERTY.siid,
+                SCHEDULING_TASK_PROPERTY.piid,
+                [self._build_get_map_data_payload(offset, min(length - offset, MAP_CHUNK_SIZE))],
+            )
+            status, data = self._preference_response(result)
+            if status not in (None, 0) or not isinstance(data, dict) or not isinstance(data.get("data"), str):
+                _LOGGER.warning("Failed to read map index %s at byte %d: %s", map_index, offset, result)
+                return None
+
+            chunk = data["data"].encode("utf-8")
+            # The mower reports how many bytes the chunk covers, which is what
+            # the next read continues from.
+            try:
+                chunk_length = int(data["size"])
+            except (KeyError, TypeError, ValueError):
+                chunk_length = len(chunk)
+
+            if chunk_length <= 0:
+                _LOGGER.warning("Map index %s read at byte %d returned no bytes: %s", map_index, offset, data)
+                return None
+
+            chunks.append(chunk[:chunk_length])
+            offset += chunk_length
+
+        # The hash is that of the document itself, so it proves the chunks came
+        # from the map named and add up to all of it: the data reads continue
+        # whichever map was named last, by this client or any other.
+        raw_document = b"".join(chunks)
+        if hashlib.md5(raw_document).hexdigest() != md5sum:
+            _LOGGER.warning("Map index %s did not read back intact", map_index)
+            return None
+
+        try:
+            document = json.loads(raw_document.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as ex:
+            _LOGGER.warning("Map index %s could not be read: %s", map_index, ex)
+            return None
+
+        if not isinstance(document, dict):
+            _LOGGER.warning("Map index %s is not a map document: %s", map_index, document)
+            return None
+
+        return document, md5sum
 
     async def fetch_firmware_status(self) -> bool:
         """Fetch firmware update availability from the cloud OTA service.
@@ -732,8 +1053,19 @@ class DreameMowerDevice:
 
         available = bool(data.get("hasNewFirmware"))
         latest = str(data["newVersion"]) if available and data.get("newVersion") else None
+        description = data.get("description")
 
+        # The service reports the version the device runs now, which moves on
+        # after an update even while the device list still names the old one.
+        current = data.get("curVersion")
+        if current and str(current) != self._firmware:
+            self._firmware = str(current)
+            self._notify_property_change(PROPERTY_FIRMWARE, self._firmware)
+
+        self._firmware_status_checked = True
         self._firmware_latest_version = latest
+        notes = str(description).strip() if available and description else ""
+        self._firmware_release_notes = notes or None
         if self._firmware_new_available != available:
             self._firmware_new_available = available
             self._notify_property_change("firmware_update_available", available)
@@ -743,6 +1075,51 @@ class DreameMowerDevice:
                 data.get("curVersion"),
                 latest,
             )
+        return True
+
+    async def start_firmware_update(self) -> bool:
+        """Ask the cloud to push the available firmware update to the mower.
+
+        The mower then downloads and installs it on its own and reports its
+        progress on 1:2 and 1:3. It has to be at rest with enough charge left:
+        waiting in standby or on the station, and at or above
+        FIRMWARE_UPDATE_MIN_BATTERY_PERCENT.
+
+        Raises:
+            ValueError: No update is available, one is already running, or the
+                mower is not in a state it can update from.
+            DreameCommandError: The request did not reach the OTA service, or the
+                service turned it down.
+        """
+        if not self._firmware_new_available:
+            raise ValueError("No firmware update is available for the mower")
+        if self.firmware_update_in_progress:
+            raise ValueError("The mower is already updating its firmware")
+        if not self._online:
+            raise ValueError("The mower is offline")
+        if self._status_code not in FIRMWARE_UPDATE_ALLOWED_STATUSES:
+            raise ValueError("The mower can only update while in standby or on the charging station")
+        if self._battery_percent < FIRMWARE_UPDATE_MIN_BATTERY_PERCENT:
+            raise ValueError(
+                f"The mower needs at least {FIRMWARE_UPDATE_MIN_BATTERY_PERCENT}% battery to update its firmware"
+            )
+
+        try:
+            response = await asyncio.get_event_loop().run_in_executor(
+                None,
+                self._cloud_device.manual_firmware_update,
+            )
+        except Exception as ex:
+            raise DreameCommandError(f"Failed to request the firmware update: {ex}") from ex
+
+        if not isinstance(response, dict):
+            raise DreameCommandError("The firmware update request got no answer")
+        if response.get("code") != 0:
+            raise DreameCommandError(
+                f"The firmware update was refused: {response.get('msg') or response.get('code')}"
+            )
+
+        _LOGGER.info("Requested firmware update to %s", self._firmware_latest_version)
         return True
 
     def _set_online(self, online: bool) -> None:
@@ -1028,8 +1405,8 @@ class DreameMowerDevice:
                     _LOGGER.error("Failed to parse pose coverage property: %s", ex)
                     return False
             elif FIRMWARE_INSTALL_STATE_PROPERTY.matches(siid, piid):
-                # Handle firmware installation state property (1:2) - firmware update status
-                # Values: 2 = New Firmware Available, 3 = Installing firmware after download
+                # Handle firmware installation state property (1:2) - the over-the-air
+                # update state, see FirmwareInstallState
                 firmware_install_state = int(message["value"])
                 if firmware_install_state not in FIRMWARE_INSTALL_STATE_MAPPING:
                     _LOGGER.warning("Unknown firmware installation state value: %s", firmware_install_state)
@@ -1327,14 +1704,51 @@ class DreameMowerDevice:
             _LOGGER.error("Failed to handle MQTT props: %s", ex)
             return False
 
+    def _cancel_transport_grace(self) -> None:
+        """Cancel a pending transport grace timer and clear the drop time."""
+        if self._transport_grace_timer is not None:
+            self._transport_grace_timer.cancel()
+            self._transport_grace_timer = None
+        self._transport_down_since = None
+
     def _handle_connected(self) -> None:
         """Handle cloud device connection established."""
+        down_since = self._transport_down_since
+        if down_since is not None:
+            _LOGGER.debug(
+                "Cloud device %s reconnected after %.1fs",
+                self._device_id, time.monotonic() - down_since,
+            )
+        self._cancel_transport_grace()
         self._last_update = datetime.now()
         self._notify_property_change("connected", True)
 
     def _handle_disconnected(self) -> None:
-        """Handle cloud device disconnection."""
-        _LOGGER.warning("Cloud device disconnected for %s", self._device_id)
+        """Handle cloud device disconnection.
+
+        The drop is only reported once it outlasts the grace period; a reconnect
+        within it cancels the report.
+        """
+        _LOGGER.debug("Cloud device transport dropped for %s", self._device_id)
+        self._cancel_transport_grace()
+        self._transport_down_since = time.monotonic()
+        timer = threading.Timer(
+            TRANSPORT_DISCONNECT_GRACE_SECONDS, self._transport_grace_expired
+        )
+        timer.daemon = True
+        self._transport_grace_timer = timer
+        timer.start()
+
+    def _transport_grace_expired(self) -> None:
+        """Report the disconnection if the transport is still down."""
+        self._transport_grace_timer = None
+        if self._cloud_device.connected:
+            return
+        self._transport_down_since = None
+        _LOGGER.warning(
+            "Cloud device disconnected for %s (no reconnect within %ss)",
+            self._device_id, TRANSPORT_DISCONNECT_GRACE_SECONDS,
+        )
         self._notify_property_change("connected", False)
 
     async def connect(self) -> bool:
@@ -1375,6 +1789,7 @@ class DreameMowerDevice:
         try:
             # Run disconnect in executor to avoid blocking
             await asyncio.get_event_loop().run_in_executor(None, self._cloud_device.disconnect)
+            self._cancel_transport_grace()
             self._notify_property_change("connected", False)
         except Exception as ex:
             _LOGGER.error("Error disconnecting from device %s: %s", self._device_id, ex)
@@ -1485,7 +1900,28 @@ class DreameMowerDevice:
         """Build the 2:50 getter payload for MAPL."""
         return {
             "m": "g",
-            "t": "MAPL",
+            "t": MAP_LIST_KEY,
+        }
+
+    def _build_get_map_info_payload(self, map_index: int) -> dict[str, Any]:
+        """Build the 2:50 getter payload for the hash and size of one map."""
+        return {
+            "m": "g",
+            "t": MAP_INFO_KEY,
+            "d": {
+                "idx": int(map_index),
+            },
+        }
+
+    def _build_get_map_data_payload(self, start: int, size: int) -> dict[str, Any]:
+        """Build the 2:50 getter payload for one chunk of the map last named by an info read."""
+        return {
+            "m": "g",
+            "t": MAP_DATA_KEY,
+            "d": {
+                "start": int(start),
+                "size": int(size),
+            },
         }
 
     def _build_get_consumable_payload(self) -> dict[str, Any]:
@@ -1581,7 +2017,7 @@ class DreameMowerDevice:
         """Build the getter payload for a map's schedule size and version."""
         return {
             "m": "g",
-            "t": SCHEDULE_INFO_KEY,
+            "t": self._schedule_document_keys[0],
             "d": {
                 "i": int(map_index),
             },
@@ -1591,7 +2027,7 @@ class DreameMowerDevice:
         """Build the getter payload for one chunk of the schedule document."""
         return {
             "m": "g",
-            "t": SCHEDULE_DATA_KEY,
+            "t": self._schedule_document_keys[1],
             "d": {
                 "s": int(start),
                 "l": int(size),
@@ -1608,12 +2044,36 @@ class DreameMowerDevice:
         """Build the setter payload for which schedule slots of a map are enabled."""
         return {
             "m": "s",
-            "t": SCHEDULE_ENABLE_KEY,
+            "t": self._schedule_document_keys[2],
             "d": {
                 "i": int(map_index),
                 "v": int(version),
                 "s": [int(bool(flag)) for flag in enabled_flags],
             },
+        }
+
+    def _build_get_schedule_tables_payload(self, table_ids: Sequence[int]) -> dict[str, Any]:
+        """Build the getter payload for the state and task list of schedule tables."""
+        return {
+            "m": "g",
+            "t": SCHEDULE_TABLE_INFO_KEY,
+            "d": [int(table_id) for table_id in table_ids],
+        }
+
+    def _build_get_schedule_table_task_payload(self, table_id: int, task_id: int) -> dict[str, Any]:
+        """Build the getter payload for one task of a schedule table."""
+        return {
+            "m": "g",
+            "t": SCHEDULE_TABLE_TASK_KEY,
+            "d": [int(table_id), int(task_id)],
+        }
+
+    def _build_set_schedule_table_enabled_payload(self, table_id: int, enabled: bool) -> dict[str, Any]:
+        """Build the setter payload that switches one schedule table on or off."""
+        return {
+            "m": "s",
+            "t": SCHEDULE_TABLE_ENABLE_KEY,
+            "d": [int(table_id), int(bool(enabled))],
         }
 
     @staticmethod
@@ -2362,6 +2822,9 @@ class DreameMowerDevice:
         if map_index is None:
             return None
 
+        if self._keeps_schedule_tables:
+            return await self._read_schedule_tables(map_index)
+
         read = await self._read_schedules(map_index)
         return None if read is None else read[0]
 
@@ -2377,6 +2840,12 @@ class DreameMowerDevice:
         if map_index is None:
             return None
 
+        # A mower that keeps tables reports the version of every task in the
+        # table read itself, and only a task that moved is read back, so a full
+        # refresh is as cheap as the poll gets.
+        if self._keeps_schedule_tables:
+            return await self.refresh_schedules(map_id)
+
         # The version only says anything about the map it was read from: every
         # map counts its own, so the same number on another map means nothing.
         if self._schedules is not None and self._schedule_map_index == map_index:
@@ -2390,7 +2859,7 @@ class DreameMowerDevice:
         self,
         map_index: int,
         schedules: Sequence[Mapping[str, Any]],
-        version: int,
+        version: int | None,
     ) -> None:
         """Cache the schedule slots of a map, which only describe the current one."""
         if not self._targets_current_map(map_index):
@@ -2417,6 +2886,18 @@ class DreameMowerDevice:
         if map_index is None:
             return None
 
+        if self._keeps_schedule_tables:
+            return await self._write_schedule_table_state(map_index, slot, enabled)
+
+        return await self._write_schedule_document_state(map_index, slot, enabled)
+
+    async def _write_schedule_document_state(
+        self,
+        map_index: int,
+        slot: int,
+        enabled: bool,
+    ) -> list[dict[str, Any]] | None:
+        """Switch one schedule slot of a map on or off through the schedule document."""
         # The write has to quote the version the mower holds its schedules under,
         # so the slots are read back before every write. A write the mower rejects
         # for a stale version is taken once more against the version it reports
@@ -2517,6 +2998,245 @@ class DreameMowerDevice:
             map_index,
             "enabled" if enabled else "disabled",
         )
+        return schedules
+
+    @property
+    def _keeps_schedule_tables(self) -> bool:
+        """Return whether the mower keeps its schedules as tables, not as a document."""
+        return self._account_type == "mova" and not self._schedule_tables_unsupported
+
+    @property
+    def _schedule_document_keys(self) -> tuple[str, str, str]:
+        """Return the info, data and enable keys of the schedule document."""
+        if self._account_type == "mova":
+            return SCHEDULE_MOVA_INFO_KEY, SCHEDULE_MOVA_DATA_KEY, SCHEDULE_MOVA_ENABLE_KEY
+        return SCHEDULE_INFO_KEY, SCHEDULE_DATA_KEY, SCHEDULE_ENABLE_KEY
+
+    @staticmethod
+    def _refuses_schedule_tables(result: Any) -> bool:
+        """Return whether a table read was answered by a mower that keeps no tables."""
+        if not isinstance(result, dict) or result.get("code") not in (None, 0):
+            return False
+
+        out_entries = result.get("out")
+        if not isinstance(out_entries, list):
+            return False
+
+        return any(
+            isinstance(out_entry, dict)
+            and "r" not in out_entry
+            and out_entry.get("d") == SCHEDULE_TABLE_UNSUPPORTED_REPLY
+            for out_entry in out_entries
+        )
+
+    @staticmethod
+    def _decode_schedule_table_task(task: Any) -> list[dict[str, Any]]:
+        """Decode one task of a schedule table into one entry per week day it runs on.
+
+        A task the mower holds switched off does not run, so it yields nothing.
+        """
+        if not isinstance(task, (list, tuple)) or len(task) <= SCHEDULE_TABLE_TASK_REGIONS_INDEX:
+            raise ValueError(f"not a task record: {task}")
+
+        if not task[SCHEDULE_TABLE_TASK_ENABLED_INDEX]:
+            return []
+
+        task_type = int(task[SCHEDULE_TABLE_TASK_TYPE_INDEX])
+        if task_type >= SCHEDULE_TABLE_CYCLIC_TYPE_OFFSET:
+            task_type -= SCHEDULE_TABLE_CYCLIC_TYPE_OFFSET
+        start_time = int(task[SCHEDULE_TABLE_TASK_START_INDEX])
+        regions = task[SCHEDULE_TABLE_TASK_REGIONS_INDEX]
+        if not isinstance(regions, list):
+            regions = []
+
+        entries: list[dict[str, Any]] = []
+        for week_day in task[SCHEDULE_TABLE_TASK_DAYS_INDEX]:
+            week_day = int(week_day)
+            entry: dict[str, Any] = {
+                "week_day": (
+                    SCHEDULE_WEEK_DAYS[week_day] if 0 <= week_day < len(SCHEDULE_WEEK_DAYS) else "unknown"
+                ),
+                "type": SCHEDULE_TASK_TYPE_MAPPING.get(task_type, "unknown"),
+                "start_time": start_time,
+            }
+            if task_type == ScheduleTaskType.ZONE:
+                entry["zone_ids"] = [int(zone_id) for zone_id in regions]
+            elif task_type == ScheduleTaskType.EDGE:
+                entry["edges"] = [[int(value) for value in pair] for pair in regions]
+            entries.append(entry)
+
+        return entries
+
+    async def _get_schedule_table_task(
+        self,
+        table_id: int,
+        task_id: int,
+        version: int,
+    ) -> list[dict[str, Any]] | None:
+        """Read and decode one task of a schedule table, reusing an unchanged one."""
+        cached = self._schedule_table_tasks.get((table_id, task_id))
+        if cached is not None and cached[0] == version:
+            return deepcopy(cached[1])
+
+        result = await self._send_task_payload(
+            "schedule task read",
+            self._build_get_schedule_table_task_payload(table_id, task_id),
+        )
+        status, data = self._preference_response(result)
+        if status not in (None, 0) or not isinstance(data, list):
+            _LOGGER.error("Failed to read task %s of schedule table %s: %s", task_id, table_id, result)
+            return None
+
+        try:
+            entries = self._decode_schedule_table_task(data)
+        except (TypeError, ValueError) as ex:
+            _LOGGER.warning("Failed to decode task %s of schedule table %s: %s", task_id, table_id, ex)
+            return None
+
+        self._schedule_table_tasks[(table_id, task_id)] = (version, deepcopy(entries))
+        return entries
+
+    async def _decode_schedule_table(self, map_index: int, table: Any) -> dict[str, Any] | None:
+        """Describe the schedule slot one table of a map stands for."""
+        if not isinstance(table, (list, tuple)) or len(table) <= SCHEDULE_TABLE_TASKS_INDEX:
+            _LOGGER.error("Schedule table is not a table record: %s", table)
+            return None
+
+        try:
+            table_id = int(table[SCHEDULE_TABLE_ID_INDEX])
+            enabled = bool(table[SCHEDULE_TABLE_ENABLED_INDEX])
+        except (TypeError, ValueError):
+            _LOGGER.error("Schedule table carries no number and state: %s", table)
+            return None
+
+        slot = table_id - map_index * SCHEDULE_SLOT_COUNT
+        if not 0 <= slot < SCHEDULE_SLOT_COUNT:
+            _LOGGER.error("Schedule table %s does not belong to map index %s", table_id, map_index)
+            return None
+
+        task_infos = table[SCHEDULE_TABLE_TASKS_INDEX]
+        if not isinstance(task_infos, list):
+            task_infos = []
+
+        # As with the document, a table that holds tasks can be switched on even
+        # when some of them could not be read: only the mower knows what they mean.
+        tasks: list[dict[str, Any]] = []
+        for task_info in task_infos:
+            try:
+                task_id, version = int(task_info[0]), int(task_info[1])
+            except (IndexError, KeyError, TypeError, ValueError):
+                _LOGGER.warning("Schedule table %s lists a task it does not identify: %s", table_id, task_info)
+                continue
+
+            entries = await self._get_schedule_table_task(table_id, task_id, version)
+            if entries is not None:
+                tasks.extend(entries)
+
+        # Every task spans several week days, so the entries are put in the order
+        # the week runs in, as the document lists them.
+        def week_order(task: dict[str, Any]) -> tuple[int, int]:
+            week_day = task["week_day"]
+            day = SCHEDULE_WEEK_DAYS.index(week_day) if week_day in SCHEDULE_WEEK_DAYS else len(SCHEDULE_WEEK_DAYS)
+            return day, int(task["start_time"])
+
+        tasks.sort(key=week_order)
+        name = table[SCHEDULE_TABLE_NAME_INDEX]
+        return {
+            "slot": slot,
+            "enabled": enabled,
+            "name": str(name) if isinstance(name, str) and name else None,
+            "tasks": tasks,
+            "tasks_stored": bool(task_infos),
+        }
+
+    async def _read_schedule_tables(self, map_index: int) -> list[dict[str, Any]] | None:
+        """Read the schedule slots of a map from the tables that stand for them."""
+        table_ids = [map_index * SCHEDULE_SLOT_COUNT + slot for slot in range(SCHEDULE_SLOT_COUNT)]
+        result = await self._send_task_payload(
+            "schedule table read",
+            self._build_get_schedule_tables_payload(table_ids),
+        )
+        if self._refuses_schedule_tables(result):
+            _LOGGER.info("This mower keeps no schedule tables, reading its schedules as a document instead")
+            self._schedule_tables_unsupported = True
+            read = await self._read_schedules(map_index)
+            return None if read is None else read[0]
+
+        status, data = self._preference_response(result)
+        if status not in (None, 0) or not isinstance(data, list):
+            _LOGGER.error("Failed to read the schedule tables of map index %s: %s", map_index, result)
+            return None
+
+        schedules: list[dict[str, Any]] = []
+        for table in data:
+            schedule = await self._decode_schedule_table(map_index, table)
+            if schedule is not None:
+                schedules.append(schedule)
+
+        schedules.sort(key=lambda schedule: schedule["slot"])
+        self._update_schedule_cache(map_index, schedules, None)
+        return schedules
+
+    async def _write_schedule_table_state(
+        self,
+        map_index: int,
+        slot: int,
+        enabled: bool,
+    ) -> list[dict[str, Any]] | None:
+        """Switch the table that stands for one schedule slot of a map on or off.
+
+        The mower runs a single table of a map at a time and switches the other
+        one off itself, so the slots are read back afterwards to report what took
+        effect.
+        """
+        schedules = await self._read_schedule_tables(map_index)
+        if schedules is None:
+            return None
+
+        # The read may just have found that the mower keeps a document instead.
+        if not self._keeps_schedule_tables:
+            return await self._write_schedule_document_state(map_index, slot, enabled)
+
+        target = next((schedule for schedule in schedules if schedule["slot"] == slot), None)
+        if target is None:
+            raise ValueError(f"This mower keeps no schedule in slot {slot}")
+
+        if enabled and not target["tasks_stored"]:
+            raise ValueError(f"The schedule in slot {slot} holds no tasks to run")
+
+        result = await self._send_task_payload(
+            "schedule table state write",
+            self._build_set_schedule_table_enabled_payload(map_index * SCHEDULE_SLOT_COUNT + slot, enabled),
+        )
+        status, _ = self._preference_response(result)
+        if status != SCHEDULE_STATUS_SUCCESS:
+            _LOGGER.error(
+                "Failed to switch schedule slot %s of map index %s %s: %s",
+                slot,
+                map_index,
+                "on" if enabled else "off",
+                result,
+            )
+            return None
+
+        _LOGGER.info(
+            "Schedule slot %s of map index %s is now %s",
+            slot,
+            map_index,
+            "enabled" if enabled else "disabled",
+        )
+
+        read_back = await self._read_schedule_tables(map_index)
+        if read_back is not None:
+            return read_back
+
+        # The write took effect even though the read back did not come through.
+        for schedule in schedules:
+            if schedule["slot"] == slot:
+                schedule["enabled"] = enabled
+            elif enabled:
+                schedule["enabled"] = False
+        self._update_schedule_cache(map_index, schedules, None)
         return schedules
 
     def refresh_current_map_id(self) -> bool:
@@ -4039,9 +4759,8 @@ class DreameMowerDevice:
     async def start_mowing_edges(self, contour_ids: list[list[int]]) -> bool:
         """Start edge mowing for specific contours.
 
-        Contour IDs are two-integer pairs such as [[1, 0], [2, 0]]. They match
-        entries in the batch map device data under MAP.* -> contours.value, where
-        each contour entry is keyed by an ID pair like [1, 0]. In Home Assistant,
+        Contour IDs are two-integer pairs such as [[1, 0], [2, 0]]: the zone and
+        the index of one of its edges, as the contours of the map name them. In Home Assistant,
         these IDs are exposed in the mower entity's contours state attribute after
         the map has been fetched.
         """

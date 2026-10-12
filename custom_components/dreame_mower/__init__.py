@@ -12,9 +12,10 @@ from datetime import timedelta
 import logging
 
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import Platform
-from homeassistant.core import HomeAssistant
+from homeassistant.const import EVENT_HOMEASSISTANT_STOP, Platform
+from homeassistant.core import Event, HomeAssistant
 from homeassistant.exceptions import ConfigEntryNotReady
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.event import async_track_time_interval
 
 from .const import (
@@ -27,6 +28,7 @@ from .const import (
     ONLINE_POLL_INTERVAL_SECONDS,
     RAIN_POLL_INTERVAL_SECONDS,
     SCHEDULE_POLL_INTERVAL_SECONDS,
+    MAP_POLL_INTERVAL_SECONDS,
 )
 from .coordinator import DreameMowerCoordinator
 from .dreame.cloud.cloud_video import DreameMowerCloudVideo
@@ -38,13 +40,13 @@ _LOGGER = logging.getLogger(__name__)
 _MOWER_PLATFORMS = (
     Platform.LAWN_MOWER,
     Platform.SENSOR,
-    Platform.BINARY_SENSOR,
     Platform.CAMERA,
     Platform.SELECT,
     Platform.BUTTON,
     Platform.NUMBER,
     Platform.SWITCH,
     Platform.TIME,
+    Platform.UPDATE,
 )
 _SWBOT_PLATFORMS = (
     Platform.SENSOR,
@@ -159,6 +161,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         DATA_VIDEO_SUPPORTED: video_supported,
     }
 
+    # Home Assistant does not unload config entries when it stops, so the MQTT
+    # client would keep handing pushes from a working mower to an event loop
+    # that is already closed. Drop the cloud connection before that happens.
+    async def _async_disconnect_on_stop(event: Event) -> None:
+        await coordinator.async_disconnect_device()
+
+    entry.async_on_unload(
+        hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, _async_disconnect_on_stop)
+    )
+
     # Periodically poll for firmware update availability (mowers only). The value
     # changes rarely and the device does not reliably push it, so poll on an interval.
     if coordinator.device_type != DEVICE_TYPE_SWBOT:
@@ -236,6 +248,33 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 cancel_on_shutdown=True,
             )
         )
+
+    # Keep the maps in step with edits made elsewhere, such as a renamed zone or
+    # a deleted map. Neither is announced, so the poll compares the hash of every
+    # map and only reads the maps back when one moved.
+    if coordinator.device_type != DEVICE_TYPE_SWBOT:
+        async def _async_poll_maps(now=None) -> None:
+            try:
+                await hass.async_add_executor_job(coordinator.device.refresh_changed_vector_map)
+            except Exception as ex:
+                _LOGGER.warning("Map poll failed: %s", ex)
+
+        entry.async_on_unload(
+            async_track_time_interval(
+                hass,
+                _async_poll_maps,
+                timedelta(seconds=MAP_POLL_INTERVAL_SECONDS),
+                cancel_on_shutdown=True,
+            )
+        )
+
+    # Firmware updates used to be reported by a binary sensor, which the update
+    # entity replaces; drop it so it does not linger as an orphan.
+    entity_registry = er.async_get(hass)
+    if retired_entity_id := entity_registry.async_get_entity_id(
+        Platform.BINARY_SENSOR, DOMAIN, f"{coordinator.device_mac}_firmware_update_available"
+    ):
+        entity_registry.async_remove(retired_entity_id)
 
     # Set up all platforms for this device/entry.
     await hass.config_entries.async_forward_entry_setups(entry, platforms)

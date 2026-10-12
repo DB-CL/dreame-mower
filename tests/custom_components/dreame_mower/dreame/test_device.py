@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import hashlib
 import json
 import logging
 import pytest
@@ -11,8 +12,10 @@ from unittest.mock import AsyncMock, Mock, patch, PropertyMock
 
 from custom_components.dreame_mower.dreame.device import DreameCommandError, DreameMowerDevice, MowingMode
 from custom_components.dreame_mower.dreame.const import (
+    TRANSPORT_DISCONNECT_GRACE_SECONDS,
     MowingDirectionMode,
     DeviceStatus,
+    FirmwareInstallState,
     MowingPreferenceMode,
     ONLINE_OFFLINE_DEBOUNCE_POLLS,
 )
@@ -42,6 +45,8 @@ class MockCloudDevice:
         self.set_property_calls = []
         self.batch_device_datas_result = None
         self.check_device_version_result = None
+        self.manual_firmware_update_result = {"code": 0, "success": True}
+        self.manual_firmware_update_calls = 0
         # get_properties returns a value, or raises when set to an Exception.
         self.get_properties_result = None
     
@@ -110,6 +115,13 @@ class MockCloudDevice:
     def check_device_version(self):
         """Mock cloud OTA firmware-availability check."""
         return self.check_device_version_result
+
+    def manual_firmware_update(self):
+        """Mock cloud OTA request to push the available firmware."""
+        self.manual_firmware_update_calls += 1
+        if isinstance(self.manual_firmware_update_result, Exception):
+            raise self.manual_firmware_update_result
+        return self.manual_firmware_update_result
 
     def get_properties(self, parameters=None, retry_count: int = 1):
         """Mock get_properties used by the online heartbeat poll."""
@@ -1017,6 +1029,229 @@ def test_fetch_vector_map_updates_current_map_id_from_mapl(device):
     assert result is True
     assert device.vector_map is vector_map
     assert device.current_map_id == 2
+
+
+_DEVICE_MAP_FIXTURE = (
+    __import__("pathlib").Path(__file__).parent / "fixtures" / "device_map_two_maps.json"
+)
+
+
+def _device_map_fixture() -> dict:
+    return json.loads(_DEVICE_MAP_FIXTURE.read_text())
+
+
+def _cached_map_batch(stored_maps: list[dict]) -> dict[str, str]:
+    """Store maps in the MAP.* keys the way the batch device data holds them."""
+    array = json.dumps([json.dumps(stored_map) for stored_map in stored_maps])
+    return {"MAP.0": array, "MAP.info": str(len(array))}
+
+
+def _encoded_map(document: dict) -> bytes:
+    """Encode a map document the way the mower holds it."""
+    return json.dumps(document, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
+def _map_responder(map_list, documents, failing=(), wrong_hashes=()):
+    """Answer the map list, map info and map data reads like a mower holding these maps.
+
+    ``documents`` is keyed by map index, and each map's hash is that of its
+    encoded document. A read of a key named in ``failing`` is answered with an
+    error, and a map index in ``wrong_hashes`` reports a hash its document does
+    not match.
+    """
+    reads: list[str] = []
+    named = {"index": None}
+
+    def reply(data):
+        return {"code": 0, "out": [{"d": data, "m": "r", "q": 1, "r": 0}]}
+
+    def respond(_siid, _aiid, parameters, _retry_count=2):
+        payload = parameters[0]
+        key = payload["t"]
+        reads.append(key)
+        if key in failing:
+            return {"code": 0, "out": [{"m": "r", "q": 1, "r": 3}]}
+        if key == "MAPL":
+            return reply(map_list)
+        if key == "MAPI":
+            index = payload["d"]["idx"]
+            named["index"] = index
+            encoded = _encoded_map(documents[index])
+            md5sum = "0" * 32 if index in wrong_hashes else hashlib.md5(encoded).hexdigest()
+            return reply({"hash": md5sum, "idx": index, "size": len(encoded)})
+        if key == "MAPD":
+            encoded = _encoded_map(documents[named["index"]])
+            start, size = payload["d"]["start"], payload["d"]["size"]
+            chunk = encoded[start:start + size]
+            return reply({"data": chunk.decode("utf-8"), "size": len(chunk), "start": start})
+        raise AssertionError(f"unexpected read {payload}")
+
+    return respond, reads
+
+
+def _fixture_documents(fixture: dict) -> dict[int, dict]:
+    return {m["info"]["idx"]: m["document"] for m in fixture["maps"]}
+
+
+def _connect_with_stored_maps(device, stored_maps: list[dict]) -> None:
+    device._cloud_device.set_connected_state(True)
+    device._cloud_device.batch_device_datas_result = _cached_map_batch(stored_maps)
+
+
+def test_fetch_vector_map_uses_the_stored_copy_while_its_hash_matches(device):
+    """A map whose stored copy carries the hash the mower reports is not read again."""
+    fixture = _device_map_fixture()
+    _connect_with_stored_maps(device, fixture["cache"])
+    device._cloud_device.action_result, reads = _map_responder(fixture["map_list"], _fixture_documents(fixture))
+
+    assert device.fetch_vector_map() is True
+
+    assert "MAPD" not in reads
+    assert [(m["index"], m["name"]) for m in device.available_maps] == [(0, "Zuhause"), (1, "Keller")]
+
+
+def test_fetch_vector_map_reads_a_changed_map_from_the_mower(device):
+    """A map edited since its stored copy was written is read from the mower.
+
+    The stored copy is only brought up to date from time to time, so a zone
+    renamed in the meantime would otherwise keep its old name.
+    """
+    fixture = _device_map_fixture()
+    documents = _fixture_documents(fixture)
+    documents[0]["map"][0]["name"] = "Vorgarten Süd"
+    _connect_with_stored_maps(device, fixture["cache"])
+    device._cloud_device.action_result, reads = _map_responder(fixture["map_list"], documents)
+
+    assert device.fetch_vector_map() is True
+
+    # The document spans several chunks, which are put back together.
+    assert reads.count("MAPD") > 1
+    assert device.current_map_id == 1
+    assert [zone["name"] for zone in device.zones] == ["Vorgarten Süd"]
+    assert device.vector_map.md5sum == hashlib.md5(_encoded_map(documents[0])).hexdigest()
+
+
+def test_fetch_vector_map_lists_only_the_slots_that_hold_a_map(device):
+    """A slot the mower reports as holding no map is left out, whatever the stored copy says."""
+    fixture = _device_map_fixture()
+    map_list = [list(fixture["map_list"][0]), [1, 0, 0, 1, 0]]
+    _connect_with_stored_maps(device, fixture["cache"])
+    device._cloud_device.action_result, _ = _map_responder(map_list, _fixture_documents(fixture))
+
+    assert device.fetch_vector_map() is True
+
+    assert [m["index"] for m in device.available_maps] == [0]
+
+
+def test_fetch_vector_map_offers_no_map_once_the_mower_holds_none(device):
+    """Once the last map is deleted, no map is offered any longer."""
+    fixture = _device_map_fixture()
+    documents = _fixture_documents(fixture)
+    _connect_with_stored_maps(device, fixture["cache"])
+    device._cloud_device.action_result, _ = _map_responder(fixture["map_list"], documents)
+    assert device.fetch_vector_map() is True
+
+    empty_list = [[0, 1, 0, 1, 0], [1, 0, 0, 1, 0]]
+    device._cloud_device.action_result, _ = _map_responder(empty_list, documents)
+
+    assert device.refresh_changed_vector_map() is True
+    assert device.available_maps == []
+    assert device.refresh_changed_vector_map() is False
+
+
+def test_fetch_vector_map_falls_back_to_the_stored_copy_without_a_map_list(device):
+    """When the mower does not report its map slots, the stored maps are used, empty slots left out."""
+    fixture = _device_map_fixture()
+    stored = [fixture["cache"][0], {**fixture["cache"][1], "md5sum": "", "mowingAreas": {"dataType": "Map", "value": []}}]
+    _connect_with_stored_maps(device, stored)
+    device._cloud_device.action_result, _ = _map_responder([], {}, failing=("MAPL",))
+
+    assert device.fetch_vector_map() is True
+
+    assert [m["index"] for m in device.available_maps] == [0]
+
+
+def test_fetch_vector_map_keeps_a_stale_map_it_cannot_read_and_retries_it(device):
+    """A map that fails to read keeps its stored copy, and the next check reads it again."""
+    fixture = _device_map_fixture()
+    documents = _fixture_documents(fixture)
+    documents[1]["name"] = "Hinterhof"
+    _connect_with_stored_maps(device, fixture["cache"])
+    device._cloud_device.action_result, _ = _map_responder(
+        fixture["map_list"], documents, failing=("MAPD",)
+    )
+
+    assert device.fetch_vector_map() is True
+    assert [(m["index"], m["name"]) for m in device.available_maps] == [(0, "Zuhause"), (1, "Keller")]
+
+    device._cloud_device.action_result, reads = _map_responder(fixture["map_list"], documents)
+    assert device.refresh_changed_vector_map() is True
+    assert "MAPD" in reads
+    assert [(m["index"], m["name"]) for m in device.available_maps] == [(0, "Zuhause"), (1, "Hinterhof")]
+
+
+def test_fetch_vector_map_rejects_a_map_that_does_not_match_its_hash(device):
+    """A map that does not read back as the hash it is held under is not taken.
+
+    The data reads continue whichever map was named last, so a read that got
+    mixed up with another one must not be stored as the current map.
+    """
+    fixture = _device_map_fixture()
+    documents = _fixture_documents(fixture)
+    documents[1]["name"] = "Hinterhof"
+    _connect_with_stored_maps(device, fixture["cache"])
+    device._cloud_device.action_result, reads = _map_responder(
+        fixture["map_list"], documents, wrong_hashes=(1,)
+    )
+
+    assert device.fetch_vector_map() is True
+
+    assert "MAPD" in reads
+    assert [(m["index"], m["name"]) for m in device.available_maps] == [(0, "Zuhause"), (1, "Keller")]
+
+
+def test_fetch_vector_map_reads_the_other_maps_when_one_is_malformed(device):
+    """A map document that cannot be parsed does not hold back the other maps."""
+    fixture = _device_map_fixture()
+    documents = _fixture_documents(fixture)
+    documents[0]["map"][0]["name"] = "Front lawn"
+    documents[1]["map"] = [{"type": 0, "data": [[0, 0], [1, 0], [1, 1]]}]
+    _connect_with_stored_maps(device, fixture["cache"])
+    device._cloud_device.action_result, _ = _map_responder(fixture["map_list"], documents)
+
+    assert device.fetch_vector_map() is True
+
+    assert [(m["index"], m["name"]) for m in device.available_maps] == [(0, "Zuhause"), (1, "Keller")]
+    assert [zone["name"] for zone in device.zones] == ["Front lawn"]
+
+
+def test_refresh_changed_vector_map_reads_nothing_back_while_no_hash_moved(device):
+    """The poll only compares hashes when no map changed."""
+    fixture = _device_map_fixture()
+    documents = _fixture_documents(fixture)
+    _connect_with_stored_maps(device, fixture["cache"])
+    device._cloud_device.action_result, _ = _map_responder(fixture["map_list"], documents)
+    assert device.fetch_vector_map() is True
+
+    device._cloud_device.action_result, reads = _map_responder(fixture["map_list"], documents)
+
+    assert device.refresh_changed_vector_map() is False
+    assert set(reads) == {"MAPL", "MAPI"}
+
+
+def test_refresh_changed_vector_map_reads_the_maps_back_once_a_map_was_deleted(device):
+    """A deleted map changes the set of map slots, which reads the maps back."""
+    fixture = _device_map_fixture()
+    documents = _fixture_documents(fixture)
+    _connect_with_stored_maps(device, fixture["cache"])
+    device._cloud_device.action_result, _ = _map_responder(fixture["map_list"], documents)
+    assert device.fetch_vector_map() is True
+
+    map_list = [list(fixture["map_list"][0]), [1, 0, 0, 1, 0]]
+    device._cloud_device.action_result, _ = _map_responder(map_list, documents)
+
+    assert device.refresh_changed_vector_map() is True
+    assert [m["index"] for m in device.available_maps] == [0]
 
 
 def test_active_map_geometry_uses_current_map_id(device):
@@ -1929,6 +2164,128 @@ def test_fetch_firmware_status_notifies_on_change(device):
     assert ("firmware_update_available", True) in notified
 
 
+def test_fetch_firmware_status_keeps_release_notes_and_marks_checked(device):
+    """The description of an available update is kept as its release notes."""
+    device._cloud_device.set_connected_state(True)
+    assert device.firmware_status_checked is False
+    device._cloud_device.check_device_version_result = {
+        "curVersion": "4.3.6_0625",
+        "newVersion": "4.3.6_0668",
+        "hasNewFirmware": True,
+        "description": "  1. Improved positioning.\n  ",
+    }
+
+    asyncio.get_event_loop().run_until_complete(device.fetch_firmware_status())
+
+    assert device.firmware_status_checked is True
+    assert device.firmware_release_notes == "1. Improved positioning."
+
+    device._cloud_device.check_device_version_result = {
+        "curVersion": "4.3.6_0668",
+        "hasNewFirmware": False,
+        "description": "1. Improved positioning.",
+    }
+    asyncio.get_event_loop().run_until_complete(device.fetch_firmware_status())
+
+    assert device.firmware_release_notes is None
+
+
+def test_fetch_firmware_status_adopts_the_reported_installed_version(device):
+    """curVersion replaces a stale installed version and announces it."""
+    device._cloud_device.set_connected_state(True)
+    device._firmware = "4.3.6_0625"
+    device._cloud_device.check_device_version_result = {
+        "curVersion": "4.3.6_0668",
+        "hasNewFirmware": False,
+    }
+    notified: list[tuple[str, object]] = []
+    device.register_property_callback(lambda name, value: notified.append((name, value)))
+
+    asyncio.get_event_loop().run_until_complete(device.fetch_firmware_status())
+
+    assert device.firmware == "4.3.6_0668"
+    assert ("firmware", "4.3.6_0668") in notified
+
+
+@pytest.mark.parametrize(
+    ("status_code", "install_state", "progress", "in_progress", "percentage"),
+    [
+        (DeviceStatus.CHARGING_COMPLETE, None, None, False, None),
+        (DeviceStatus.CHARGING_COMPLETE, FirmwareInstallState.UPGRADING, 40, True, 40),
+        # Download progress alone shows an update under way before 1:2 does.
+        (DeviceStatus.CHARGING_COMPLETE, FirmwareInstallState.IDLE, 12, True, 12),
+        (DeviceStatus.UPDATING, FirmwareInstallState.IDLE, None, True, None),
+        # A finished or failed update leaves its last progress value behind.
+        (DeviceStatus.CHARGING_COMPLETE, FirmwareInstallState.UPGRADE_SUCCESS, 100, False, None),
+        (DeviceStatus.CHARGING_COMPLETE, FirmwareInstallState.UPGRADE_FAILED, 45, False, None),
+    ],
+)
+def test_firmware_update_in_progress(device, status_code, install_state, progress, in_progress, percentage):
+    """An update runs while 1:2, 1:3 or the status say so."""
+    device._status_code = status_code
+    device._firmware_install_state = install_state
+    device._firmware_download_progress = progress
+
+    assert device.firmware_update_in_progress is in_progress
+    assert device.firmware_update_percentage == percentage
+
+
+def _ready_for_firmware_update(device):
+    device._firmware_new_available = True
+    device._firmware_latest_version = "4.3.6_0668"
+    device._status_code = DeviceStatus.CHARGING_COMPLETE
+    device._battery_percent = 80
+
+
+def test_start_firmware_update_requests_it_from_the_cloud(device):
+    """A docked, charged mower with an update pending gets it requested."""
+    _ready_for_firmware_update(device)
+
+    result = asyncio.get_event_loop().run_until_complete(device.start_firmware_update())
+
+    assert result is True
+    assert device._cloud_device.manual_firmware_update_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        ({"_firmware_new_available": False}, "No firmware update"),
+        ({"_firmware_install_state": FirmwareInstallState.UPGRADING}, "already updating"),
+        ({"_online": False}, "offline"),
+        ({"_status_code": DeviceStatus.MOWING}, "standby or on the charging station"),
+        ({"_battery_percent": 19}, "at least 20% battery"),
+    ],
+)
+def test_start_firmware_update_refuses_when_the_mower_cannot_update(device, change, message):
+    """Nothing is requested unless the mower is at rest and charged enough."""
+    _ready_for_firmware_update(device)
+    for attribute, value in change.items():
+        setattr(device, attribute, value)
+
+    with pytest.raises(ValueError, match=message):
+        asyncio.get_event_loop().run_until_complete(device.start_firmware_update())
+
+    assert device._cloud_device.manual_firmware_update_calls == 0
+
+
+@pytest.mark.parametrize(
+    ("response", "message"),
+    [
+        ({"code": 10001, "msg": "device busy"}, "refused: device busy"),
+        (None, "got no answer"),
+        (ConnectionError("unreachable"), "unreachable"),
+    ],
+)
+def test_start_firmware_update_reports_a_failed_request(device, response, message):
+    """A request the OTA service did not accept is an error with its reason."""
+    _ready_for_firmware_update(device)
+    device._cloud_device.manual_firmware_update_result = response
+
+    with pytest.raises(DreameCommandError, match=message):
+        asyncio.get_event_loop().run_until_complete(device.start_firmware_update())
+
+
 
 def _heartbeat_props(byte17: int, byte18: int, code: int = 0):
     """Build a get_properties response for property 1:1 with the given bytes."""
@@ -2033,6 +2390,114 @@ def test_incoming_message_restores_online(device):
 
     assert device.online is True
     assert ("online", True) in notified
+
+
+class _FakeTimer:
+    """Stand-in for threading.Timer that only fires when told to."""
+
+    instances: list["_FakeTimer"] = []
+
+    def __init__(self, interval, function):
+        self.interval = interval
+        self.function = function
+        self.cancelled = False
+        self.daemon = False
+        _FakeTimer.instances.append(self)
+
+    def start(self):
+        pass
+
+    def cancel(self):
+        self.cancelled = True
+
+
+@pytest.fixture
+def fake_timer():
+    """Replace the transport grace timer with a manually fired one."""
+    _FakeTimer.instances = []
+    with patch(
+        "custom_components.dreame_mower.dreame.device.threading.Timer", _FakeTimer
+    ):
+        yield _FakeTimer
+
+
+def test_transport_drop_within_grace_stays_connected(device, fake_timer, caplog):
+    """A transport drop followed by a quick reconnect never reports disconnected."""
+    notified: list[tuple[str, object]] = []
+    device.register_property_callback(lambda name, value: notified.append((name, value)))
+    device._cloud_device.set_connected_state(True)
+
+    device._cloud_device.set_connected_state(False)
+    with caplog.at_level(logging.WARNING):
+        device._handle_disconnected()
+        # Still within the grace period: reported connected, nothing notified.
+        assert device.connected is True
+        assert ("connected", False) not in notified
+
+        device._cloud_device.set_connected_state(True)
+        device._handle_connected()
+
+    assert fake_timer.instances[0].cancelled is True
+    assert device.connected is True
+    assert ("connected", False) not in notified
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+def test_transport_drop_past_grace_reports_disconnected(device, fake_timer, caplog):
+    """A drop that outlasts the grace period is reported once, with one warning."""
+    notified: list[tuple[str, object]] = []
+    device.register_property_callback(lambda name, value: notified.append((name, value)))
+    device._cloud_device.set_connected_state(True)
+
+    device._cloud_device.set_connected_state(False)
+    with caplog.at_level(logging.WARNING):
+        device._handle_disconnected()
+        timer = fake_timer.instances[0]
+        assert timer.interval == TRANSPORT_DISCONNECT_GRACE_SECONDS
+        timer.function()
+
+    assert device.connected is False
+    assert notified.count(("connected", False)) == 1
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len(warnings) == 1
+    assert "Cloud device disconnected" in warnings[0].getMessage()
+
+
+def test_transport_grace_expires_by_clock(device, fake_timer):
+    """The connected property itself stops covering the drop once the grace has run."""
+    device._cloud_device.set_connected_state(False)
+    with patch(
+        "custom_components.dreame_mower.dreame.device.time.monotonic",
+        side_effect=[1000.0, 1000.0 + TRANSPORT_DISCONNECT_GRACE_SECONDS + 1],
+    ):
+        device._handle_disconnected()
+        assert device.connected is False
+
+
+def test_transport_grace_timer_ignored_after_reconnect(device, fake_timer):
+    """A grace timer that fires after the link came back reports nothing."""
+    notified: list[tuple[str, object]] = []
+    device.register_property_callback(lambda name, value: notified.append((name, value)))
+
+    device._cloud_device.set_connected_state(False)
+    device._handle_disconnected()
+    device._cloud_device.set_connected_state(True)
+    fake_timer.instances[0].function()
+
+    assert device.connected is True
+    assert ("connected", False) not in notified
+
+
+@pytest.mark.asyncio
+async def test_disconnect_cancels_transport_grace(device, fake_timer):
+    """An explicit disconnect drops the grace and reports disconnected at once."""
+    device._cloud_device.set_connected_state(False)
+    device._handle_disconnected()
+
+    await device.disconnect()
+
+    assert fake_timer.instances[0].cancelled is True
+    assert device.connected is False
 
 
 # A full mowing preference record as reported for a map-wide (area 0) entry.
@@ -3832,6 +4297,288 @@ async def test_refresh_changed_schedules_reads_another_map_back_in_full(device):
     await device.refresh_changed_schedules()
 
     assert "SCHDDV3" in [call[2][0]["t"] for call in device._cloud_device.action_calls]
+
+
+def _schedule_table_responder(tables=None, tasks=None, write_status=0):
+    """Build an action responder serving schedule tables, their tasks and writes.
+
+    Tables are keyed by their number and tasks by (table, task id); the mower
+    switches the other table of a map off when one is switched on.
+    """
+    served = {
+        "tables": {
+            2: [2, 1, 1, "Summer", [[0, 11], [1, 12]], 7],
+            3: [3, 0, 1, "", [], 7],
+        } if tables is None else tables,
+        "tasks": {
+            (2, 0): [0, 1, 0, 540, [1, 4], []],
+            (2, 1): [1, 1, 1, 600, [0], [3, 5]],
+        } if tasks is None else tasks,
+    }
+    writes: list[list] = []
+
+    def responder(siid, aiid, parameters, retry_count):
+        payload = parameters[0]
+        if payload["t"] == "SCHDI":
+            return {"code": 0, "out": [{"m": "r", "r": 0, "d": [
+                served["tables"][table_id] for table_id in payload["d"] if table_id in served["tables"]
+            ]}]}
+
+        if payload["t"] == "SCHDC":
+            task = served["tasks"].get(tuple(payload["d"]))
+            if task is None:
+                return {"code": 0, "out": [{"m": "r", "r": 7}]}
+            return {"code": 0, "out": [{"m": "r", "r": 0, "d": task}]}
+
+        if payload["t"] == "SCHDS":
+            writes.append(payload["d"])
+            if write_status == 0:
+                table_id, enabled = payload["d"]
+                served["tables"][table_id][1] = enabled
+                if enabled:
+                    other = table_id ^ 1
+                    if other in served["tables"]:
+                        served["tables"][other][1] = 0
+            return {"code": 0, "out": [{"m": "r", "r": write_status}]}
+
+        raise AssertionError(f"Unexpected schedule payload: {payload}")
+
+    return responder, writes, served
+
+
+async def _connected_schedule_table_device(device, **kwargs):
+    """Connect a mower that keeps schedule tables, on the map with index 1."""
+    device._account_type = "mova"
+    device._cloud_device.set_connected_state(True)
+    await device.connect()
+    device._current_map_id = 2
+    responder, writes, served = _schedule_table_responder(**kwargs)
+    device._cloud_device.action_result = responder
+    return writes, served
+
+
+def _sent_tags(device):
+    return [call[2][0]["t"] for call in device._cloud_device.action_calls]
+
+
+@pytest.mark.asyncio
+async def test_refresh_schedules_reads_the_tables_of_the_current_map(device):
+    """A mower keeping tables reports the two slots of a map as tables of their own."""
+    await _connected_schedule_table_device(device)
+
+    schedules = await device.refresh_schedules()
+
+    assert schedules == [
+        {
+            "slot": 0,
+            "enabled": True,
+            "name": "Summer",
+            "tasks": [
+                {"week_day": "sunday", "type": "zone", "start_time": 600, "zone_ids": [3, 5]},
+                {"week_day": "monday", "type": "all_area", "start_time": 540},
+                {"week_day": "thursday", "type": "all_area", "start_time": 540},
+            ],
+            "tasks_stored": True,
+        },
+        {"slot": 1, "enabled": False, "name": None, "tasks": [], "tasks_stored": False},
+    ]
+    assert device.schedules == schedules
+    table_reads = [call[2][0] for call in device._cloud_device.action_calls if call[2][0]["t"] == "SCHDI"]
+    assert table_reads == [{"m": "g", "t": "SCHDI", "d": [2, 3]}]
+    assert "SCHDIV3" not in _sent_tags(device)
+
+
+@pytest.mark.asyncio
+async def test_refresh_schedules_decodes_edge_and_cyclic_table_tasks(device):
+    """Edge tasks carry (zone, side) pairs, and a cyclic task is the same kind of task."""
+    await _connected_schedule_table_device(
+        device,
+        tables={2: [2, 0, 1, "", [[0, 1], [1, 1]], 7], 3: [3, 0, 1, "", [], 7]},
+        tasks={
+            (2, 0): [0, 1, 2, 375, [6], [[2, 1]]],
+            (2, 1): [1, 1, 8, 480, [3], []],
+        },
+    )
+
+    schedules = await device.refresh_schedules()
+
+    assert schedules is not None
+    assert schedules[0]["tasks"] == [
+        {"week_day": "wednesday", "type": "all_area", "start_time": 480},
+        {"week_day": "saturday", "type": "edge", "start_time": 375, "edges": [[2, 1]]},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_refresh_schedules_leaves_out_a_table_task_that_is_switched_off(device):
+    """A task the mower holds switched off does not run, but the table still holds tasks."""
+    await _connected_schedule_table_device(
+        device,
+        tables={2: [2, 0, 1, "", [[0, 1]], 7], 3: [3, 0, 1, "", [], 7]},
+        tasks={(2, 0): [0, 0, 0, 540, [1], []]},
+    )
+
+    schedules = await device.refresh_schedules()
+
+    assert schedules is not None
+    assert schedules[0]["tasks"] == []
+    assert schedules[0]["tasks_stored"] is True
+
+
+@pytest.mark.asyncio
+async def test_refresh_changed_schedules_only_reads_back_the_table_tasks_that_moved(device):
+    """A task is only read again once the version the table lists for it moved."""
+    _, served = await _connected_schedule_table_device(device)
+    await device.refresh_schedules()
+    device._cloud_device.action_calls.clear()
+
+    await device.refresh_changed_schedules()
+    assert _sent_tags(device) == ["SCHDI"]
+
+    served["tables"][2][4] = [[0, 11], [1, 13]]
+    served["tasks"][(2, 1)] = [1, 1, 1, 720, [0], [3]]
+    device._cloud_device.action_calls.clear()
+
+    schedules = await device.refresh_changed_schedules()
+
+    assert _sent_tags(device) == ["SCHDI", "SCHDC"]
+    assert device._cloud_device.action_calls[1][2][0]["d"] == [2, 1]
+    assert schedules is not None
+    assert {"week_day": "sunday", "type": "zone", "start_time": 720, "zone_ids": [3]} in schedules[0]["tasks"]
+
+
+@pytest.mark.asyncio
+async def test_a_table_task_that_cannot_be_read_leaves_the_rest_of_the_schedule(device):
+    """A task the mower does not serve drops out, and the table can still be switched."""
+    await _connected_schedule_table_device(
+        device,
+        tables={2: [2, 0, 1, "", [[0, 1], [5, 1]], 7], 3: [3, 0, 1, "", [], 7]},
+        tasks={(2, 0): [0, 1, 0, 540, [1], []]},
+    )
+
+    schedules = await device.refresh_schedules()
+
+    assert schedules is not None
+    assert schedules[0]["tasks"] == [{"week_day": "monday", "type": "all_area", "start_time": 540}]
+    assert schedules[0]["tasks_stored"] is True
+
+
+@pytest.mark.asyncio
+async def test_set_schedule_enabled_switches_a_table_and_reads_the_slots_back(device):
+    """Switching a table on addresses it by number, and the mower turns the other one off."""
+    writes, _ = await _connected_schedule_table_device(
+        device,
+        tables={
+            2: [2, 1, 1, "Summer", [[0, 11]], 7],
+            3: [3, 0, 1, "Winter", [[0, 21]], 7],
+        },
+        tasks={(2, 0): [0, 1, 0, 540, [1], []], (3, 0): [0, 1, 0, 600, [2], []]},
+    )
+
+    schedules = await device.set_schedule_enabled(1, True)
+
+    assert writes == [[3, 1]]
+    assert schedules is not None
+    assert [schedule["enabled"] for schedule in schedules] == [False, True]
+    assert [schedule["enabled"] for schedule in device.schedules or []] == [False, True]
+
+
+def _mova_document_responder(**kwargs):
+    """Serve a MOVA mower that keeps no tables, only the generation two document.
+
+    The table read is answered the way a MOVA 1000 answers it: no status, and 7
+    where the tables would be.
+    """
+    responder, writes, served = _schedule_responder(**kwargs)
+
+    def mova_responder(siid, aiid, parameters, retry_count):
+        payload = parameters[0]
+        if payload["t"] == "SCHDI":
+            return {"aiid": 50, "code": 0, "out": [{"d": 7, "m": "r", "q": 30}], "siid": 2}
+        if payload["t"] in ("SCHDIV2", "SCHDDV2", "SCHDSV2"):
+            return responder(siid, aiid, [{**payload, "t": payload["t"][:-1] + "3"}], retry_count)
+        raise AssertionError(f"Unexpected schedule payload: {payload}")
+
+    return mova_responder, writes, served
+
+
+async def _connected_mova_document_device(device, **kwargs):
+    """Connect a MOVA mower that keeps its schedules as a document."""
+    device._account_type = "mova"
+    device._cloud_device.set_connected_state(True)
+    await device.connect()
+    device._current_map_id = 1
+    responder, writes, served = _mova_document_responder(**kwargs)
+    device._cloud_device.action_result = responder
+    return writes, served
+
+
+@pytest.mark.asyncio
+async def test_a_mova_mower_without_tables_has_its_schedules_read_as_a_document(device):
+    """A table read the mower turns down falls back to the document, once for the session."""
+    await _connected_mova_document_device(
+        device,
+        plans=[_schedule_plan(0, False), _schedule_plan(1, False)],
+        version=65535,
+    )
+
+    schedules = await device.refresh_schedules()
+
+    assert schedules == [
+        {"slot": 0, "enabled": False, "name": None, "tasks": [], "tasks_stored": False},
+        {"slot": 1, "enabled": False, "name": None, "tasks": [], "tasks_stored": False},
+    ]
+    assert device.schedules == schedules
+    assert _sent_tags(device)[:2] == ["SCHDI", "SCHDIV2"]
+    assert "SCHDIV3" not in _sent_tags(device)
+
+    device._cloud_device.action_calls.clear()
+    await device.refresh_changed_schedules()
+    assert _sent_tags(device) == ["SCHDIV2"]
+
+
+@pytest.mark.asyncio
+async def test_a_mova_mower_without_tables_switches_its_schedules_through_the_document(device):
+    """Switching a slot on such a mower writes the generation two document state."""
+    writes, _ = await _connected_mova_document_device(device)
+
+    schedules = await device.set_schedule_enabled(0, False)
+
+    assert writes == [{"i": 0, "v": 4711, "s": [0, 0]}]
+    assert schedules is not None
+    assert [schedule["enabled"] for schedule in schedules] == [False, False]
+    assert "SCHDSV2" in _sent_tags(device)
+    assert "SCHDS" not in _sent_tags(device)
+
+
+@pytest.mark.asyncio
+async def test_a_failed_table_read_does_not_switch_to_the_document(device):
+    """Only the reply of a mower that keeps no tables moves the reads to the document."""
+    await _connected_schedule_table_device(device)
+    device._cloud_device.action_result = lambda *args: {"code": 0, "out": [{"m": "r", "r": 7}]}
+
+    assert await device.refresh_schedules() is None
+    assert device._keeps_schedule_tables
+
+
+@pytest.mark.asyncio
+async def test_set_schedule_enabled_refuses_an_empty_table(device):
+    """An empty table has nothing to run, so switching it on is refused."""
+    writes, _ = await _connected_schedule_table_device(device)
+
+    with pytest.raises(ValueError):
+        await device.set_schedule_enabled(1, True)
+
+    assert writes == []
+
+
+@pytest.mark.asyncio
+async def test_set_schedule_enabled_reports_a_table_write_the_mower_refused(device):
+    """A refused write leaves the slots as they were."""
+    writes, _ = await _connected_schedule_table_device(device, write_status=8)
+
+    assert await device.set_schedule_enabled(0, False) is None
+    assert writes == [[2, 0]]
 
 
 def _unreachable_responder(reason="Device offline: the mower did not answer"):

@@ -47,6 +47,12 @@ class EventIdentifier(NamedTuple):
 # to unavailable and back on a single missed poll.
 ONLINE_OFFLINE_DEBOUNCE_POLLS = 3
 
+# Seconds the cloud transport (MQTT) may stay down before the device is reported
+# disconnected. The cloud broker drops the link now and then and the client
+# reconnects within a second or two; without this grace every such drop flips all
+# entities to unavailable and back.
+TRANSPORT_DISCONNECT_GRACE_SECONDS = 60
+
 # Device property identifiers
 PROPERTY_1_1 = PropertyIdentifier(siid=1, piid=1, name="property_1_1")
 FIRMWARE_INSTALL_STATE_PROPERTY = PropertyIdentifier(siid=1, piid=2, name="firmware_install_state")
@@ -310,6 +316,25 @@ SCHEDULE_INFO_KEY = "SCHDIV3"
 SCHEDULE_DATA_KEY = "SCHDDV3"
 SCHEDULE_ENABLE_KEY = "SCHDSV3"
 
+# MOVA mowers that refuse the table reads below keep their plans as the same
+# document, one generation back. They do not answer the keys above at all, so
+# only these reach them.
+SCHEDULE_MOVA_INFO_KEY = "SCHDIV2"
+SCHEDULE_MOVA_DATA_KEY = "SCHDDV2"
+SCHEDULE_MOVA_ENABLE_KEY = "SCHDSV2"
+
+# The maps of a mower are read from the mower itself in three steps. The map
+# list reports which of its fixed map slots hold a map and which one is
+# current, an info read reports the hash and byte length of one map, and the
+# map document is then read in chunks. A data read carries no map index: it
+# continues the map the info read before it named.
+MAP_LIST_KEY = "MAPL"
+MAP_INFO_KEY = "MAPI"
+MAP_DATA_KEY = "MAPD"
+
+# Bytes requested per chunk of a map document.
+MAP_CHUNK_SIZE = 400
+
 # Schedule slots every map is known to hold. The mower reports the slots it
 # keeps, so this only stands in while they have not been read yet.
 SCHEDULE_SLOT_COUNT = 2
@@ -342,6 +367,39 @@ SCHEDULE_PLAN_TASKS_INDEX = 3
 # whole frame, so a task without elements is the shortest one there can be.
 SCHEDULE_TASK_START_MARKER = 0xAA
 SCHEDULE_TASK_MINIMUM_LENGTH = 7
+
+# MOVA mowers keep their schedules as tables instead of a single document, and
+# refuse the document reads above. Every schedule slot of every map is a table
+# of its own, numbered across the maps: map index * SCHEDULE_SLOT_COUNT + slot.
+# A table read reports each table's state, its name and the tasks it holds as
+# (task id, version) pairs, and every task is then read on its own. A task's
+# version moves whenever it is edited, so an unchanged one need not be read
+# again. A table is switched on or off on its own, by its number.
+SCHEDULE_TABLE_INFO_KEY = "SCHDI"
+SCHEDULE_TABLE_TASK_KEY = "SCHDC"
+SCHEDULE_TABLE_ENABLE_KEY = "SCHDS"
+
+# A mower that does not keep tables answers the table read with this value and
+# no status, where a table it keeps comes with a zero status.
+SCHEDULE_TABLE_UNSUPPORTED_REPLY = 7
+
+# Layout of one table as the table read reports it.
+SCHEDULE_TABLE_ID_INDEX = 0
+SCHEDULE_TABLE_ENABLED_INDEX = 1
+SCHEDULE_TABLE_NAME_INDEX = 3
+SCHEDULE_TABLE_TASKS_INDEX = 4
+
+# Layout of one task of a table: its id, whether it is enabled, its type, its
+# start time in minutes since midnight, the week days it runs on, and the zones
+# or (zone, side) edge pairs it covers.
+SCHEDULE_TABLE_TASK_ENABLED_INDEX = 1
+SCHEDULE_TABLE_TASK_TYPE_INDEX = 2
+SCHEDULE_TABLE_TASK_START_INDEX = 3
+SCHEDULE_TABLE_TASK_DAYS_INDEX = 4
+SCHEDULE_TABLE_TASK_REGIONS_INDEX = 5
+
+# Task types from this offset on are the cyclic variants of the ones below it.
+SCHEDULE_TABLE_CYCLIC_TYPE_OFFSET = 8
 
 
 class ScheduleTaskType(IntEnum):
@@ -456,16 +514,34 @@ CHARGING_STATUS_MAPPING: dict[int, str] = {
     16: "charging_paused_low_temperature",  # Charging paused: battery temperature too low (issue #40)
 }
 
-# Firmware install state values for FIRMWARE_INSTALL_STATE_PROPERTY
-FIRMWARE_INSTALL_STATE_NEW_AVAILABLE = 2
+class FirmwareInstallState(IntEnum):
+    """Over-the-air update states reported on FIRMWARE_INSTALL_STATE_PROPERTY (1:2)."""
+    UNDEFINED = 0
+    IDLE = 1
+    UPGRADING = 2
+    UPGRADE_SUCCESS = 3
+    UPGRADE_FAILED = 4
+    CANNOT_UPGRADE = 5
 
-# Firmware install state mapping for FIRMWARE_INSTALL_STATE_PROPERTY
+
 FIRMWARE_INSTALL_STATE_MAPPING: dict[int, str] = {
-    1: "up_to_date",  # Idle / firmware is current (no update available)
-    FIRMWARE_INSTALL_STATE_NEW_AVAILABLE: "new_firmware_available",
-    3: "installing_firmware_after_download",
-    4: "firmware_download_failed",  # Observed in issues #98, #134
+    FirmwareInstallState.UNDEFINED: "undefined",
+    FirmwareInstallState.IDLE: "idle",
+    FirmwareInstallState.UPGRADING: "upgrading",
+    FirmwareInstallState.UPGRADE_SUCCESS: "upgrade_success",
+    FirmwareInstallState.UPGRADE_FAILED: "upgrade_failed",
+    FirmwareInstallState.CANNOT_UPGRADE: "cannot_upgrade",
 }
+
+# A firmware update is only started from a mower that is at rest: waiting in
+# standby or sitting on the station. It is refused below this battery level, as
+# the mower has to stay powered through the download and the install.
+FIRMWARE_UPDATE_ALLOWED_STATUSES: frozenset[int] = frozenset({
+    DeviceStatus.STANDBY,
+    DeviceStatus.CHARGING,
+    DeviceStatus.CHARGING_COMPLETE,
+})
+FIRMWARE_UPDATE_MIN_BATTERY_PERCENT = 20
 
 # Individual property names
 PROPERTY_FIRMWARE = "firmware"
