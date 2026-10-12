@@ -328,13 +328,11 @@ class DreameMowerCameraEntity(DreameMowerEntity, Camera):
             _LOGGER.info("Device is back online, resuming pose coverage requests")
             self._start_pose_coverage_timer()
 
-        if property_name == "vector_map_updated":
-            # Vector map data was fetched — re-render if we have no historical data
-            if not self._current_map_data and self._is_on:
-                self.hass.create_task(self._async_update_vector_map_image())
-        elif property_name == CURRENT_MAP_ID_PROPERTY_NAME:
-            # The static map shows the active map, so a switch redraws it. The
-            # live map is drawn on the map being mowed and is left alone.
+        if property_name in ("vector_map_updated", CURRENT_MAP_ID_PROPERTY_NAME):
+            # The static map shows the active map, so it is redrawn once the maps
+            # are read (which tells which missions belong to the active map) and
+            # on every switch. The live map is drawn on the map being mowed and
+            # is left alone.
             if not self._session_active and self._is_on:
                 self.hass.create_task(self._async_update_image())
         elif property_name == POSE_COVERAGE_COORDINATES_PROPERTY_NAME:
