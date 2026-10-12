@@ -360,6 +360,18 @@ class TestActiveMapImage:
 
         mock_update.assert_called_once_with()
 
+    def test_reading_the_maps_redraws_the_static_map(self, camera_entity):
+        """Once the maps are read, the image is redrawn for the active map."""
+        camera_entity._session_active = False
+        camera_entity._current_map_data = {"md5": "hash-pature"}
+        camera_entity.hass = Mock()
+        camera_entity.hass.create_task = Mock(side_effect=lambda coro: coro.close())
+
+        with patch.object(camera_entity, "_async_update_image") as mock_update:
+            camera_entity._handle_property_change("vector_map_updated", True)
+
+        mock_update.assert_called_once_with()
+
     def test_a_map_switch_leaves_the_live_map_alone(self, camera_entity):
         """During a mowing session the live map is not redrawn on a switch."""
         camera_entity._session_active = True
