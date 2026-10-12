@@ -7,6 +7,7 @@ import pytest
 
 from custom_components.dreame_mower.dreame.map_data_parser import (
     MowerVectorMap,
+    MowerZone,
     MowerMowPath,
     assemble_vector_map,
     MowerMapBoundary,
@@ -630,17 +631,18 @@ def test_convert_device_map_stores_a_tilted_rectangle_the_way_it_renders():
 # ---------------------------------------------------------------------------
 
 def _map_with_box(map_id: int, x1: int, x2: int) -> MowerVectorMap:
+    """A map whose single zone is the rectangle x1..x2 by -1000..1000."""
     vmap = MowerVectorMap(map_id=map_id, map_index=map_id - 1)
-    vmap.boundary = MowerMapBoundary(x1=x1, y1=-1000, x2=x2, y2=1000)
+    vmap.zones = [MowerZone(zone_id=1, path=[(x1, -1000), (x2, -1000), (x2, 1000), (x1, 1000)])]
     return vmap
 
 
 def test_assemble_keeps_each_maps_own_mowing_trails():
     """The maps share one coordinate system; each keeps the trails within it."""
-    pelouse = _map_with_box(1, -400, 200)
-    pature = _map_with_box(2, -1300, -350)
-    on_pelouse = [(0, 0), (100, 0), (100, 10)]
-    on_pature = [(-1200, 0), (-900, 0), (-900, 10)]
+    pelouse = _map_with_box(1, -40000, 20000)
+    pature = _map_with_box(2, -130000, -35000)
+    on_pelouse = [(0, 0), (10000, 0), (10000, 500)]
+    on_pature = [(-120000, 0), (-90000, 0), (-90000, 500)]
     trails = [MowerMowPath(zone_id=0, segments=[on_pature, on_pelouse])]
 
     assemble_vector_map([pelouse, pature], trails)
@@ -657,3 +659,16 @@ def test_assemble_keeps_all_trails_on_a_single_map():
     assemble_vector_map([only], trails)
 
     assert only.mow_paths == trails
+
+
+def test_assemble_keeps_the_edge_pass_just_outside_a_zone():
+    """The edge-mowing pass runs along the boundary, partly just outside it."""
+    pelouse = _map_with_box(1, 0, 10000)
+    pature = _map_with_box(2, -30000, -20000)
+    edge = [(x, 1500) for x in range(0, 10000, 1000)]  # 500 outside the top edge
+    trails = [MowerMowPath(zone_id=0, segments=[edge])]
+
+    assemble_vector_map([pelouse, pature], trails)
+
+    assert pelouse.mow_paths == trails
+    assert pature.mow_paths == []
