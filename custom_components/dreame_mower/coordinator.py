@@ -66,9 +66,9 @@ from .dreame.property.property_misc import (
 # a re-read. The device announces every change, including the ones it was just
 # told to make, and a write already knows what it wrote.
 _SETTINGS_WRITE_ECHO_SECONDS = 5.0
-# The mower echoes a map switch on 2:50 as it applies it; the map list is read
-# back a moment later so that it already reports the new map.
-_MAP_SWITCH_READ_BACK_DELAY_SECONDS = 2.0
+# The mower echoes a map switch on 2:50 before its map list always reports the
+# new map, so the list is read back a few times until the active map moves.
+_MAP_SWITCH_READ_BACK_DELAYS_SECONDS = (2.0, 3.0, 5.0)
 
 # The two records the device announces changes to, each with its own echo window
 # so a write to one does not suppress a re-read of the other.
@@ -1175,12 +1175,17 @@ class DreameMowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def _async_refresh_current_map_on_switch(self) -> None:
         """Re-read the active map after the mower announced a map switch."""
-        # The echo can arrive just ahead of the map list taking on the switch.
-        await asyncio.sleep(_MAP_SWITCH_READ_BACK_DELAY_SECONDS)
-        try:
-            await self.hass.async_add_executor_job(self.device.refresh_current_map_id)
-        except Exception as ex:
-            _LOGGER.warning("Active map refresh after a map switch failed: %s", ex)
+        before = self.device.current_map_id
+        for delay in _MAP_SWITCH_READ_BACK_DELAYS_SECONDS:
+            await asyncio.sleep(delay)
+            try:
+                await self.hass.async_add_executor_job(self.device.refresh_current_map_id)
+            except Exception as ex:
+                _LOGGER.warning("Active map refresh after a map switch failed: %s", ex)
+                return
+            if self.device.current_map_id != before:
+                return
+        _LOGGER.debug("Map switch announced, but the active map stayed map ID %s", before)
 
     async def _async_refresh_preferences_on_map_change(self) -> None:
         """Re-read the mowing settings after the active map changed."""

@@ -1408,6 +1408,7 @@ class DreameMowerDevice:
                 if not self._scheduling_handler.handle_property_update(siid, piid, message["value"], self._notify_property_change):
                     return False  # Parsing failed - treat as unhandled property
                 if SCHEDULING_TASK_PROPERTY.matches(siid, piid) and self._is_map_switch_echo(message["value"]):
+                    _LOGGER.debug("Map switch announced on 2:50: %s", message["value"])
                     self._notify_property_change(MAP_SWITCH_ANNOUNCED_PROPERTY_NAME, None)
             elif MOWER_CONTROL_STATUS_PROPERTY.matches(siid, piid):
                 # Handle mower control status property (2:56)
