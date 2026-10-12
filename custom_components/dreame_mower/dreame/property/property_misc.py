@@ -74,7 +74,8 @@ _LINK_MODULE_VALID_PLAN_RSSI = 128
 _HEARTBEAT_SENTINEL = 0xCE
 
 # Byte 17 is the Wi-Fi link's signal strength as a signed byte: a negative value
-# is the RSSI in dBm, and zero means the mower is not on Wi-Fi.
+# is the RSSI in dBm. Any other value is taken as no reading (the connectivity
+# poll already treats zero as no Wi-Fi uplink).
 _WIFI_RSSI_INDEX = 17
 
 # The 22-byte heartbeat (dreame.mower.g2541e, A3 AWD Pro) frames the payload with
