@@ -820,8 +820,9 @@ def _mow_paths_on_map(mow_paths: list[MowerMowPath], vmap: MowerVectorMap) -> li
     """Keep the mowing trails that run on one map.
 
     The maps of a mower share one coordinate system, and M_PATH holds the
-    trails of all of them, so each map keeps only the segments that run
-    mostly within its zones. A map without zones keeps them all.
+    trails of all of them, so each map keeps the segments that run mostly
+    within its zones, cut to the part within them. A map without zones keeps
+    them all.
     """
     polygons = [zone.path for zone in vmap.zones if len(zone.path) >= 3]
     if not polygons:
@@ -847,10 +848,22 @@ def _mow_paths_on_map(mow_paths: list[MowerMowPath], vmap: MowerVectorMap) -> li
 
     kept: list[MowerMowPath] = []
     for path in mow_paths:
-        segments = [
-            segment for segment in path.segments
-            if segment and 2 * sum(on_map(point) for point in segment) > len(segment)
-        ]
+        segments: list[list[tuple[int, int]]] = []
+        for segment in path.segments:
+            flags = [on_map(point) for point in segment]
+            if 2 * sum(flags) <= len(segment):
+                continue  # a trail of another map
+            # Cut the trail where it leaves the map, such as the drive to another map.
+            run: list[tuple[int, int]] = []
+            for point, flag in zip(segment, flags):
+                if flag:
+                    run.append(point)
+                    continue
+                if len(run) > 1:
+                    segments.append(run)
+                run = []
+            if len(run) > 1:
+                segments.append(run)
         if segments:
             kept.append(MowerMowPath(zone_id=path.zone_id, segments=segments))
     return kept

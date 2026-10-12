@@ -61,7 +61,8 @@
           "map_rotation": "Kartrotation",
           "map_show_title": "Visa karttitel",
           "map_show_legend": "Visa kartförklaring",
-          "map_padding": "Kartutfyllnad (pixlar)"
+          "map_padding": "Kartutfyllnad (pixlar)",
+          "map_fit": "Anpassa bilden efter kartans form"
         }
       }
     }

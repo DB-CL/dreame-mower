@@ -11,6 +11,7 @@ CONF_MAP_ROTATION: Final = "map_rotation"
 CONF_MAP_SHOW_TITLE: Final = "map_show_title"
 CONF_MAP_SHOW_LEGEND: Final = "map_show_legend"
 CONF_MAP_PADDING: Final = "map_padding"
+CONF_MAP_FIT: Final = "map_fit"
 
 # Data storage keys
 DATA_COORDINATOR = "coordinator"

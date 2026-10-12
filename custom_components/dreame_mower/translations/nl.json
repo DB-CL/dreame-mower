@@ -61,7 +61,8 @@
           "map_rotation": "Kaartrotatie",
           "map_show_title": "Kaarttitel weergeven",
           "map_show_legend": "Kaartlegenda weergeven",
-          "map_padding": "Kaartopvulling (pixels)"
+          "map_padding": "Kaartopvulling (pixels)",
+          "map_fit": "Afbeelding aanpassen aan de kaartvorm"
         }
       }
     }

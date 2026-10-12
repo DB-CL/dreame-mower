@@ -61,7 +61,8 @@
           "map_rotation": "Rotação do mapa",
           "map_show_title": "Mostrar título do mapa",
           "map_show_legend": "Mostrar legenda do mapa",
-          "map_padding": "Margem do mapa (píxeis)"
+          "map_padding": "Margem do mapa (píxeis)",
+          "map_fit": "Ajustar a imagem à forma do mapa"
         }
       }
     }
