@@ -10,7 +10,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.components.sensor import SensorEntity, SensorDeviceClass, SensorStateClass
-from homeassistant.const import PERCENTAGE, EntityCategory, UnitOfArea
+from homeassistant.const import PERCENTAGE, SIGNAL_STRENGTH_DECIBELS_MILLIWATT, EntityCategory, UnitOfArea
 
 from .const import DATA_COORDINATOR, DOMAIN
 from .coordinator import DreameMowerCoordinator
@@ -43,6 +43,8 @@ async def async_setup_entry(
             DreameMowerAccountSensor(coordinator),
             DreameMowerChargingStatusSensor(coordinator),
             DreameMowerBluetoothSensor(coordinator),
+            DreameMowerSignalSensor(coordinator, "wifi_signal", "mdi:wifi"),
+            DreameMowerSignalSensor(coordinator, "cellular_signal", "mdi:signal-cellular-3"),
             DreameMowerDeviceCodeSensor(coordinator),
             DreameMowerTaskSensor(coordinator),
             DreameMowerProgressSensor(coordinator),
@@ -171,6 +173,32 @@ class DreameMowerBluetoothSensor(DreameMowerEntity, SensorEntity):
         return {
             "bluetooth_connected": self.coordinator.device_bluetooth_connected,
         }
+
+
+class DreameMowerSignalSensor(DreameMowerEntity, SensorEntity):
+    """Signal strength of one of the mower's links, from its heartbeat.
+
+    Recorded alongside the mower's position (the mowing progress sensor's x and
+    y), it shows where on the lawn each link weakens.
+    """
+
+    def __init__(self, coordinator: DreameMowerCoordinator, key: str, icon: str) -> None:
+        """Initialize the signal sensor for the "wifi_signal" or "cellular_signal" link."""
+        super().__init__(coordinator, key)
+        self._key = key
+        self._attr_device_class = SensorDeviceClass.SIGNAL_STRENGTH
+        self._attr_state_class = SensorStateClass.MEASUREMENT
+        self._attr_native_unit_of_measurement = SIGNAL_STRENGTH_DECIBELS_MILLIWATT
+        self._attr_entity_category = EntityCategory.DIAGNOSTIC
+        self._attr_icon = icon
+        self._attr_translation_key = key
+
+    @property
+    def native_value(self) -> int | None:
+        """Return the signal strength in dBm."""
+        if self._key == "wifi_signal":
+            return self.coordinator.wifi_signal_dbm
+        return self.coordinator.cellular_signal_dbm
 
 
 class DreameMowerDeviceCodeSensor(DreameMowerEntity, SensorEntity):
