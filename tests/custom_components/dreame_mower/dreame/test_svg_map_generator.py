@@ -459,3 +459,33 @@ class TestFitCanvas:
         svg = generate_svg_map_image(data, None, mock_coordinator, rotation=0, padding=10, fit=True).decode()
 
         assert '<svg width="1200" height="443" viewBox="0 0 1200 443"' in svg
+
+
+def test_each_mission_of_a_mowing_gets_its_own_colour(mock_coordinator):
+    """The latest mission keeps the mowing path colour, an earlier one another."""
+    outline = [[0, 0], [9000, 0], [9000, 3000], [0, 3000], [0, 0]]
+    data = {
+        "map": [{"data": outline, "track": []}],
+        "session_tracks": [[[100, 100], [200, 100]], [[300, 300], [400, 300]]],
+    }
+
+    svg = generate_svg_map_image(data, None, mock_coordinator, rotation=0).decode()
+
+    assert 'stroke="#8e44ad"' in svg  # the earlier mission
+    assert 'stroke="#ffa500"' in svg  # the latest mission
+
+
+def test_the_legend_dates_each_mission_of_a_mowing(mock_coordinator):
+    """With the legend on, each mission's trail is listed by its start (UTC)."""
+    outline = [[0, 0], [9000, 0], [9000, 3000], [0, 3000], [0, 0]]
+    data = {
+        "map": [{"data": outline, "track": []}],
+        "session_tracks": [[[100, 100], [200, 100]], [[300, 300], [400, 300]]],
+        "session_starts": [1791714776, 1791800014],
+        "start": 1791714776,
+    }
+
+    svg = generate_svg_map_image(data, None, mock_coordinator, rotation=0, show_legend=True).decode()
+
+    assert "Mowing 2026-10-11 10:32" in svg
+    assert "Mowing 2026-10-12 10:13" in svg

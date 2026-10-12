@@ -339,6 +339,52 @@ class TestActiveMapImage:
 
         assert await camera_entity._find_most_recent_historical_file() == active
 
+    @staticmethod
+    def _results(paths, *results):
+        """Give each mission file a result and a one-segment trail."""
+        for i, (path, result) in enumerate(zip(paths, results)):
+            data = json.loads(Path(path).read_text())
+            data["result"] = result
+            data["start"] = 1000 - i
+            data["map"][0]["track"] = [[i, 0], [i, 1]]
+            Path(path).write_text(json.dumps(data))
+
+    @pytest.mark.asyncio
+    async def test_gathers_the_stopped_missions_of_the_latest_mowing(self, camera_entity, mock_coordinator, tmp_path):
+        """Missions stopped since the last finished one are drawn together."""
+        paths = self._missions(tmp_path, self.ACTIVE, self.OTHER, self.ACTIVE, self.ACTIVE)
+        self._results(paths, 3, 1, 3, 1)  # stopped, other map, stopped, finished
+        camera_entity._cache_built = True
+        camera_entity._historical_files_cache = [(p, 10.0 - i) for i, p in enumerate(paths)]
+        mock_coordinator.device.vector_map = self._active_map(self.ACTIVE)
+
+        assert await camera_entity._find_current_cycle() == [paths[0], paths[2]]
+
+    @pytest.mark.asyncio
+    async def test_a_finished_mission_is_drawn_alone(self, camera_entity, mock_coordinator, tmp_path):
+        """The latest mission, finished, is the whole mowing."""
+        paths = self._missions(tmp_path, self.ACTIVE, self.ACTIVE)
+        self._results(paths, 1, 3)
+        camera_entity._cache_built = True
+        camera_entity._historical_files_cache = [(p, 10.0 - i) for i, p in enumerate(paths)]
+        mock_coordinator.device.vector_map = self._active_map(self.ACTIVE)
+
+        assert await camera_entity._find_current_cycle() == [paths[0]]
+
+    def test_loads_a_mowing_with_each_missions_trail_apart(self, camera_entity, tmp_path):
+        """The trails of a mowing come oldest first, the outline from the newest."""
+        paths = self._missions(tmp_path, self.ACTIVE, self.ACTIVE)
+        self._results(paths, 3, 3)
+
+        data = camera_entity._load_cycle_sync(paths)
+
+        assert data["session_tracks"] == [
+            [[1, 0], [1, 1], [2147483647, 2147483647]],
+            [[0, 0], [0, 1], [2147483647, 2147483647]],
+        ]
+        assert data["session_starts"] == [999, 1000]
+        assert data["start"] == 999
+
     @pytest.mark.asyncio
     async def test_compares_each_mission_with_a_map_once(self, camera_entity, mock_coordinator, tmp_path):
         """The outline comparison of a mission is remembered for the same map."""
