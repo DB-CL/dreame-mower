@@ -19,13 +19,16 @@ from .entity import DreameMowerEntity
 from .dreame.const import CURRENT_MAP_ID_PROPERTY_NAME, POSE_COVERAGE_PROPERTY
 from .dreame.property.pose_coverage import POSE_COVERAGE_COORDINATES_PROPERTY_NAME
 from .dreame.property.property_misc import PROPERTY_1_1_TASK_STATUS_NAME
-from .dreame.map_data_parser import vector_map_to_map_data
+from .dreame.map_data_parser import outline_matches_zones, vector_map_to_map_data
 from .dreame.svg_map_generator import generate_svg_map_image
 
 _LOGGER = logging.getLogger(__name__)
 
 # Pose coverage property request interval during live mowing sessions
 POSE_COVERAGE_REQUEST_INTERVAL = 120  # 2 minutes in seconds
+
+# Marker between the segments of a point list in mission files
+_SEGMENT_BREAK = 2147483647
 
 
 async def async_setup_entry(
@@ -76,8 +79,10 @@ class DreameMowerCameraEntity(DreameMowerEntity, Camera):
         # Historical files cache
         self._historical_files_cache: list[tuple[str, float]] = []  # [(file_path, mtime), ...]
         self._cache_built = False
-        # Hash of the map each mission file was mowed on, by file path
-        self._mission_map_hashes: dict[str, str | None] = {}
+        # Zone outlines recorded in each mission file, by file path, and whether
+        # a mission is on a map, by file path and the map's zone outlines
+        self._mission_outlines: dict[str, list[list[tuple[int, int]]]] = {}
+        self._mission_on_map: dict[tuple[str, int], bool] = {}
         
         # Track current rotation to detect changes
         self._current_rotation = self.config_entry.options.get(CONF_MAP_ROTATION, 0)
@@ -444,29 +449,48 @@ class DreameMowerCameraEntity(DreameMowerEntity, Camera):
             _LOGGER.error("Error reading historical file %s: %s", full_path, ex)
             return None
 
-    def _mission_map_hash_sync(self, full_path: str) -> str | None:
-        """Return the hash of the map a mission file was mowed on (cached per file)."""
-        if full_path not in self._mission_map_hashes:
+    def _mission_outlines_sync(self, full_path: str) -> list[list[tuple[int, int]]]:
+        """Return the mowing zone outlines a mission file recorded, in map units (cached per file)."""
+        if full_path not in self._mission_outlines:
             data = self._load_historical_file_sync(full_path)
-            md5 = data.get("md5") if isinstance(data, dict) else None
-            self._mission_map_hashes[full_path] = md5 if isinstance(md5, str) else None
-        return self._mission_map_hashes[full_path]
+            outlines: list[list[tuple[int, int]]] = []
+            items = data.get("map", []) if isinstance(data, dict) else []
+            for item in items if isinstance(items, list) else []:
+                if not isinstance(item, dict) or item.get("type", 0) != 0:
+                    continue  # passages and no-go areas are not the map's outline
+                outline: list[tuple[int, int]] = []
+                for point in item.get("data", []):
+                    if point[0] == _SEGMENT_BREAK and point[1] == _SEGMENT_BREAK:
+                        outlines.append(outline)
+                        outline = []
+                    else:
+                        # Mission files store decimeters, maps a unit ten times finer.
+                        outline.append((point[0] * 10, point[1] * 10))
+                outlines.append(outline)
+            self._mission_outlines[full_path] = [o for o in outlines if o]
+        return self._mission_outlines[full_path]
 
-    def _most_recent_mission_on_map_sync(self, map_hash: str) -> str | None:
-        """Return the most recent mission file mowed on the map with this hash."""
+    def _most_recent_mission_on_map_sync(self, zones: list[Any]) -> str | None:
+        """Return the most recent mission file mowed on the map with these zones."""
+        zones_key = hash(tuple(tuple(map(tuple, zone.path)) for zone in zones))
         for full_path, _mtime in self._historical_files_cache:
-            if self._mission_map_hash_sync(full_path) == map_hash:
+            key = (full_path, zones_key)
+            if key not in self._mission_on_map:
+                # Comparing outlines takes a while, so each mission is compared
+                # with a map once, until the map's outline changes.
+                self._mission_on_map[key] = outline_matches_zones(self._mission_outlines_sync(full_path), zones)
+            if self._mission_on_map[key]:
                 return full_path
         return None
 
     async def _find_most_recent_historical_file(self, force_refresh: bool = False) -> str | None:
         """Find the most recent mission file of the active map.
 
-        A mission file records the hash of the map it was mowed on, which is
-        also the hash of that map as the mower reports it. While the active
-        map's hash is known, only a mission on that map is shown, so that
+        A mission file records the outline of the map it was mowed on, so
+        only a mission whose outline is that of the active map is shown, and
         switching maps does not leave the previous map's last mission on
-        screen; without one the map itself is drawn.
+        screen. Without such a mission the map itself is drawn. The map's hash
+        is no use here: it changes without the outline changing.
 
         Returns:
             Full path to the mission file, or None if there is none to show
@@ -480,12 +504,12 @@ class DreameMowerCameraEntity(DreameMowerEntity, Camera):
                 return None
 
             vector_map = self.coordinator.device.vector_map
-            map_hash = vector_map.md5sum if vector_map is not None else None
-            if not map_hash:
+            zones = list(vector_map.zones) if vector_map is not None else []
+            if not zones:
                 return self._historical_files_cache[0][0]  # First item is most recent
 
             return await asyncio.get_event_loop().run_in_executor(
-                None, self._most_recent_mission_on_map_sync, map_hash
+                None, self._most_recent_mission_on_map_sync, zones
             )
                 
         except Exception as ex:

@@ -869,6 +869,45 @@ def _mow_paths_on_map(mow_paths: list[MowerMowPath], vmap: MowerVectorMap) -> li
     return kept
 
 
+# Share of points that must lie on the other outline for two outlines to be
+# taken as the same map
+_OUTLINE_MATCH_SHARE = 0.9
+# Points sampled from each outline when comparing them
+_OUTLINE_SAMPLE_POINTS = 200
+
+
+def _sample(points: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Return at most _OUTLINE_SAMPLE_POINTS points, evenly spread."""
+    step = max(1, len(points) // _OUTLINE_SAMPLE_POINTS)
+    return points[::step]
+
+
+def outline_matches_zones(outlines: list[list[tuple[int, int]]], zones: list[MowerZone]) -> bool:
+    """Return whether zone outlines recorded elsewhere are those of these zones.
+
+    Both ways round, nearly every point of one outline has to lie on the
+    other, within the edge tolerance. One outline covering only part of the
+    other, or two maps that merely touch, does not match.
+    """
+    polygons = [list(zone.path) for zone in zones if len(zone.path) >= 3]
+    rings = [outline for outline in outlines if len(outline) >= 3]
+    if not polygons or not rings:
+        return False
+
+    def share_near(points: list[tuple[int, int]], shapes: list[list[tuple[int, int]]]) -> float:
+        sample = _sample(points)
+        near = sum(
+            any(_near_polygon(point, shape, _TRAIL_EDGE_TOLERANCE) for shape in shapes)
+            for point in sample
+        )
+        return near / len(sample)
+
+    return (
+        share_near([p for ring in rings for p in ring], polygons) >= _OUTLINE_MATCH_SHARE
+        and share_near([p for polygon in polygons for p in polygon], rings) >= _OUTLINE_MATCH_SHARE
+    )
+
+
 def assemble_vector_map(
     parsed_maps: list[MowerVectorMap],
     mow_paths: list[MowerMowPath],

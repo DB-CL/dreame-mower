@@ -309,43 +309,67 @@ class TestCameraCallbackLifecycle:
 class TestActiveMapImage:
     """The static map shows the active map, with its own last mission if any."""
 
+    # Two neighbouring maps, as zone outlines in map units (mission files store
+    # the same outline at a tenth of the scale).
+    ACTIVE = [(0, 0), (60000, 0), (60000, 30000), (0, 30000)]
+    OTHER = [(-90000, 0), (-1000, 0), (-1000, 30000), (-90000, 30000)]
+
     @staticmethod
-    def _missions(tmp_path, *hashes):
-        """Write mission files, most recent first, and return their paths."""
+    def _missions(tmp_path, *outlines):
+        """Write mission files recording these outlines, most recent first."""
         paths = []
-        for i, md5 in enumerate(hashes):
+        for i, outline in enumerate(outlines):
             path = tmp_path / f"mission_{i}.json"
-            path.write_text(json.dumps({"md5": md5}))
+            data = [[x // 10, y // 10] for x, y in outline]
+            path.write_text(json.dumps({"md5": f"hash-{i}", "map": [{"type": 0, "data": data}]}))
             paths.append(str(path))
         return paths
+
+    @staticmethod
+    def _active_map(outline):
+        return Mock(zones=[Mock(path=outline)])
 
     @pytest.mark.asyncio
     async def test_shows_the_last_mission_of_the_active_map(self, camera_entity, mock_coordinator, tmp_path):
         """A more recent mission on another map is skipped."""
-        other, active = self._missions(tmp_path, "hash-other", "hash-active")
+        other, active = self._missions(tmp_path, self.OTHER, self.ACTIVE)
         camera_entity._cache_built = True
         camera_entity._historical_files_cache = [(other, 2.0), (active, 1.0)]
-        mock_coordinator.device.vector_map = Mock(md5sum="hash-active")
+        mock_coordinator.device.vector_map = self._active_map(self.ACTIVE)
 
         assert await camera_entity._find_most_recent_historical_file() == active
 
     @pytest.mark.asyncio
-    async def test_draws_the_map_when_it_has_no_mission(self, camera_entity, mock_coordinator, tmp_path):
-        """With no mission on the active map, the map itself is drawn."""
-        (other,) = self._missions(tmp_path, "hash-other")
+    async def test_compares_each_mission_with_a_map_once(self, camera_entity, mock_coordinator, tmp_path):
+        """The outline comparison of a mission is remembered for the same map."""
+        (other,) = self._missions(tmp_path, self.OTHER)
         camera_entity._cache_built = True
         camera_entity._historical_files_cache = [(other, 2.0)]
-        mock_coordinator.device.vector_map = Mock(md5sum="hash-active")
+        mock_coordinator.device.vector_map = self._active_map(self.ACTIVE)
+
+        with patch("custom_components.dreame_mower.camera.outline_matches_zones", return_value=False) as compare:
+            await camera_entity._find_most_recent_historical_file()
+            await camera_entity._find_most_recent_historical_file()
+
+        compare.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_draws_the_map_when_it_has_no_mission(self, camera_entity, mock_coordinator, tmp_path):
+        """With no mission on the active map, the map itself is drawn."""
+        (other,) = self._missions(tmp_path, self.OTHER)
+        camera_entity._cache_built = True
+        camera_entity._historical_files_cache = [(other, 2.0)]
+        mock_coordinator.device.vector_map = self._active_map(self.ACTIVE)
 
         assert await camera_entity._find_most_recent_historical_file() is None
 
     @pytest.mark.asyncio
-    async def test_shows_the_last_mission_while_the_map_hash_is_unknown(self, camera_entity, mock_coordinator, tmp_path):
-        """Without the active map's hash, the most recent mission is shown as before."""
-        first, second = self._missions(tmp_path, "hash-other", "hash-active")
+    async def test_shows_the_last_mission_while_the_map_is_unknown(self, camera_entity, mock_coordinator, tmp_path):
+        """Without the active map's zones, the most recent mission is shown as before."""
+        first, second = self._missions(tmp_path, self.OTHER, self.ACTIVE)
         camera_entity._cache_built = True
         camera_entity._historical_files_cache = [(first, 2.0), (second, 1.0)]
-        mock_coordinator.device.vector_map = Mock(md5sum=None)
+        mock_coordinator.device.vector_map = None
 
         assert await camera_entity._find_most_recent_historical_file() == first
 
