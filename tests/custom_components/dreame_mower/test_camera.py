@@ -304,3 +304,68 @@ class TestCameraCallbackLifecycle:
 
         mock_stop.assert_called_once()
         mock_start.assert_not_called()
+
+
+class TestActiveMapImage:
+    """The static map shows the active map, with its own last mission if any."""
+
+    @staticmethod
+    def _missions(tmp_path, *hashes):
+        """Write mission files, most recent first, and return their paths."""
+        paths = []
+        for i, md5 in enumerate(hashes):
+            path = tmp_path / f"mission_{i}.json"
+            path.write_text(json.dumps({"md5": md5}))
+            paths.append(str(path))
+        return paths
+
+    @pytest.mark.asyncio
+    async def test_shows_the_last_mission_of_the_active_map(self, camera_entity, mock_coordinator, tmp_path):
+        """A more recent mission on another map is skipped."""
+        other, active = self._missions(tmp_path, "hash-pature", "hash-pelouse")
+        camera_entity._cache_built = True
+        camera_entity._historical_files_cache = [(other, 2.0), (active, 1.0)]
+        mock_coordinator.device.vector_map = Mock(md5sum="hash-pelouse")
+
+        assert await camera_entity._find_most_recent_historical_file() == active
+
+    @pytest.mark.asyncio
+    async def test_draws_the_map_when_it_has_no_mission(self, camera_entity, mock_coordinator, tmp_path):
+        """With no mission on the active map, the map itself is drawn."""
+        (other,) = self._missions(tmp_path, "hash-pature")
+        camera_entity._cache_built = True
+        camera_entity._historical_files_cache = [(other, 2.0)]
+        mock_coordinator.device.vector_map = Mock(md5sum="hash-pelouse")
+
+        assert await camera_entity._find_most_recent_historical_file() is None
+
+    @pytest.mark.asyncio
+    async def test_shows_the_last_mission_while_the_map_hash_is_unknown(self, camera_entity, mock_coordinator, tmp_path):
+        """Without the active map's hash, the most recent mission is shown as before."""
+        first, second = self._missions(tmp_path, "hash-pature", "hash-pelouse")
+        camera_entity._cache_built = True
+        camera_entity._historical_files_cache = [(first, 2.0), (second, 1.0)]
+        mock_coordinator.device.vector_map = Mock(md5sum=None)
+
+        assert await camera_entity._find_most_recent_historical_file() == first
+
+    def test_a_map_switch_redraws_the_static_map(self, camera_entity):
+        """Switching maps outside a mowing session redraws the image."""
+        camera_entity._session_active = False
+        camera_entity.hass = Mock()
+        camera_entity.hass.create_task = Mock(side_effect=lambda coro: coro.close())
+
+        with patch.object(camera_entity, "_async_update_image") as mock_update:
+            camera_entity._handle_property_change("current_map_id", 1)
+
+        mock_update.assert_called_once_with()
+
+    def test_a_map_switch_leaves_the_live_map_alone(self, camera_entity):
+        """During a mowing session the live map is not redrawn on a switch."""
+        camera_entity._session_active = True
+        camera_entity.hass = Mock()
+
+        with patch.object(camera_entity, "_async_update_image") as mock_update:
+            camera_entity._handle_property_change("current_map_id", 1)
+
+        mock_update.assert_not_called()

@@ -16,7 +16,7 @@ from .const import DATA_COORDINATOR, DOMAIN, CONF_MAP_ROTATION, CONF_MAP_SHOW_TI
 from .coordinator import DreameMowerCoordinator
 from .entity import DreameMowerEntity
 
-from .dreame.const import POSE_COVERAGE_PROPERTY
+from .dreame.const import CURRENT_MAP_ID_PROPERTY_NAME, POSE_COVERAGE_PROPERTY
 from .dreame.property.pose_coverage import POSE_COVERAGE_COORDINATES_PROPERTY_NAME
 from .dreame.property.property_misc import PROPERTY_1_1_TASK_STATUS_NAME
 from .dreame.map_data_parser import vector_map_to_map_data
@@ -76,6 +76,8 @@ class DreameMowerCameraEntity(DreameMowerEntity, Camera):
         # Historical files cache
         self._historical_files_cache: list[tuple[str, float]] = []  # [(file_path, mtime), ...]
         self._cache_built = False
+        # Hash of the map each mission file was mowed on, by file path
+        self._mission_map_hashes: dict[str, str | None] = {}
         
         # Track current rotation to detect changes
         self._current_rotation = self.config_entry.options.get(CONF_MAP_ROTATION, 0)
@@ -319,6 +321,11 @@ class DreameMowerCameraEntity(DreameMowerEntity, Camera):
             # Vector map data was fetched — re-render if we have no historical data
             if not self._current_map_data and self._is_on:
                 self.hass.create_task(self._async_update_vector_map_image())
+        elif property_name == CURRENT_MAP_ID_PROPERTY_NAME:
+            # The static map shows the active map, so a switch redraws it. The
+            # live map is drawn on the map being mowed and is left alone.
+            if not self._session_active and self._is_on:
+                self.hass.create_task(self._async_update_image())
         elif property_name == POSE_COVERAGE_COORDINATES_PROPERTY_NAME:
             self._handle_live_coordinates_update(value)
         elif property_name == PROPERTY_1_1_TASK_STATUS_NAME:
@@ -434,22 +441,49 @@ class DreameMowerCameraEntity(DreameMowerEntity, Camera):
             _LOGGER.error("Error reading historical file %s: %s", full_path, ex)
             return None
 
+    def _mission_map_hash_sync(self, full_path: str) -> str | None:
+        """Return the hash of the map a mission file was mowed on (cached per file)."""
+        if full_path not in self._mission_map_hashes:
+            data = self._load_historical_file_sync(full_path)
+            md5 = data.get("md5") if isinstance(data, dict) else None
+            self._mission_map_hashes[full_path] = md5 if isinstance(md5, str) else None
+        return self._mission_map_hashes[full_path]
+
+    def _most_recent_mission_on_map_sync(self, map_hash: str) -> str | None:
+        """Return the most recent mission file mowed on the map with this hash."""
+        for full_path, _mtime in self._historical_files_cache:
+            if self._mission_map_hash_sync(full_path) == map_hash:
+                return full_path
+        return None
+
     async def _find_most_recent_historical_file(self, force_refresh: bool = False) -> str | None:
-        """Find the most recent historical file using the cached file list.
-        
+        """Find the most recent mission file of the active map.
+
+        A mission file records the hash of the map it was mowed on, which is
+        also the hash of that map as the mower reports it. While the active
+        map's hash is known, only a mission on that map is shown, so that
+        switching maps does not leave the previous map's last mission on
+        screen; without one the map itself is drawn.
+
         Returns:
-            Full path to the most recent .json file, or None if none found
+            Full path to the mission file, or None if there is none to show
         """
         try:
             # Build cache if not built yet
             if not self._cache_built or force_refresh:
                 await self._refresh_historical_files_cache()
-            
-            # Return the most recent file from cache
-            if self._historical_files_cache:
-                return self._historical_files_cache[0][0]  # First item is most recent
-            else:
+
+            if not self._historical_files_cache:
                 return None
+
+            vector_map = self.coordinator.device.vector_map
+            map_hash = vector_map.md5sum if vector_map is not None else None
+            if not map_hash:
+                return self._historical_files_cache[0][0]  # First item is most recent
+
+            return await asyncio.get_event_loop().run_in_executor(
+                None, self._most_recent_mission_on_map_sync, map_hash
+            )
                 
         except Exception as ex:
             _LOGGER.error("Error getting most recent historical file from cache: %s", ex)
@@ -477,7 +511,9 @@ class DreameMowerCameraEntity(DreameMowerEntity, Camera):
 
         historical_file = await self._find_most_recent_historical_file(force_refresh=force_refresh)
         if not historical_file:
-            # No historical files — try the vector map
+            # No mission to show — draw the map itself
+            self._current_map_data = None
+            self._historical_file_path = None
             await self._async_update_vector_map_image()
             return
 
