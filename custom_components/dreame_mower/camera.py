@@ -16,6 +16,7 @@ from .const import DATA_COORDINATOR, DATA_VIDEO_RUNTIME, DATA_VIDEO_SUPPORTED, D
 from .coordinator import DreameMowerCoordinator
 from .entity import DreameMowerEntity
 from .live_camera import create_live_camera
+from .point_cloud import point_cloud_url
 
 from .dreame.const import CURRENT_MAP_ID_PROPERTY_NAME, POSE_COVERAGE_PROPERTY
 from .dreame.property.pose_coverage import POSE_COVERAGE_COORDINATES_PROPERTY_NAME
@@ -58,6 +59,9 @@ async def async_setup_entry(
 
 class DreameMowerCameraEntity(DreameMowerEntity, Camera):
     """Camera entity for Dreame Mower map visualization."""
+
+    # The 3D map endpoints only serve the 3D map card; keep them out of the history.
+    _unrecorded_attributes = frozenset({"point_cloud_maps", "point_cloud_active_index"})
 
     def __init__(self, coordinator: DreameMowerCoordinator, config_entry: ConfigEntry) -> None:
         """Initialize the camera."""
@@ -350,6 +354,8 @@ class DreameMowerCameraEntity(DreameMowerEntity, Camera):
             # is left alone.
             if not self._session_active and self._is_on:
                 self.hass.create_task(self._async_update_image())
+            # The 3D map card follows the active map through the attributes.
+            self.schedule_update_ha_state()
         elif property_name == POSE_COVERAGE_COORDINATES_PROPERTY_NAME:
             self._handle_live_coordinates_update(value)
         elif property_name == PROPERTY_1_1_TASK_STATUS_NAME:
@@ -648,6 +654,26 @@ class DreameMowerCameraEntity(DreameMowerEntity, Camera):
             padding=self._current_padding,
             fit=self._current_fit,
         )
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """List the maps' 3D map endpoints for the 3D map card, and the active map."""
+        device = self.coordinator.device
+        maps = [m for m in device.available_maps if isinstance(m.get("index"), int)]
+        current = device.current_map_id
+        return {
+            "point_cloud_maps": [
+                {
+                    "index": m["index"],
+                    "name": m["name"],
+                    "url": point_cloud_url(self.config_entry.entry_id, m["index"]),
+                }
+                for m in maps
+            ],
+            "point_cloud_active_index": next(
+                (m["index"] for m in maps if m["id"] == current), None
+            ),
+        }
 
     @property
     def available(self) -> bool:

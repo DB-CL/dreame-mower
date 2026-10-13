@@ -1,6 +1,10 @@
 {
   "domain": "dreame_mower",
   "name": "Dreame Mower",
+  "after_dependencies": [
+    "frontend",
+    "http"
+  ],
   "codeowners": [
     "@antondaubert"
   ],
