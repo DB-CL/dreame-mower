@@ -5,9 +5,12 @@ from unittest.mock import Mock
 
 import pytest
 
+from homeassistant.components import websocket_api
+from homeassistant.helpers import entity_registry as er
 from homeassistant.setup import async_setup_component
+from pytest_homeassistant_custom_component.common import MockConfigEntry
 
-from custom_components.dreame_mower.const import DATA_POINT_CLOUD, DOMAIN
+from custom_components.dreame_mower.const import DATA_COORDINATOR, DATA_POINT_CLOUD, DOMAIN
 from custom_components.dreame_mower.dreame.point_cloud import (
     PointCloudError,
     build_point_cloud_list_payload,
@@ -18,6 +21,7 @@ from custom_components.dreame_mower.point_cloud import (
     DreameMowerPointCloudView,
     PointCloudStore,
     point_cloud_url,
+    ws_point_clouds,
 )
 
 
@@ -151,3 +155,47 @@ class TestPointCloudView:
         hass.http.register_view(DreameMowerPointCloudView())
         client = await hass_client_no_auth()
         assert (await client.get(point_cloud_url("entry1", 0))).status == 401
+
+
+class TestPointCloudsCommand:
+    """The card asks for the maps of its mower over the WebSocket API."""
+
+    @pytest.fixture
+    async def ws(self, hass, hass_ws_client):
+        assert await async_setup_component(hass, "websocket_api", {})
+        websocket_api.async_register_command(hass, ws_point_clouds)
+        entry = MockConfigEntry(domain=DOMAIN, entry_id="entry1")
+        entry.add_to_hass(hass)
+        registry = er.async_get(hass)
+        registry.async_get_or_create("lawn_mower", DOMAIN, "AA:BB_mower", config_entry=entry, suggested_object_id="shaun")
+        registry.async_get_or_create("select", DOMAIN, "AA:BB_map_select", config_entry=entry, suggested_object_id="shaun_map")
+        registry.async_get_or_create("lawn_mower", "other", "x", suggested_object_id="other")
+        coordinator = Mock()
+        coordinator.device_mac = "AA:BB"
+        coordinator.device.available_maps = [
+            {"id": 1, "index": 0, "name": "Lawn", "area": 300},
+            {"id": 2, "index": 1, "name": "Meadow", "area": 900},
+        ]
+        coordinator.device.current_map_id = 2
+        hass.data.setdefault(DOMAIN, {})["entry1"] = {DATA_COORDINATOR: coordinator, DATA_POINT_CLOUD: Mock()}
+        return await hass_ws_client(hass)
+
+    async def test_lists_the_maps_and_the_active_one(self, ws):
+        await ws.send_json({"id": 1, "type": "dreame_mower/point_clouds", "entity_id": "lawn_mower.shaun"})
+        msg = await ws.receive_json()
+        assert msg["success"]
+        assert msg["result"] == {
+            "maps": [
+                {"index": 0, "name": "Lawn", "url": "/api/dreame_mower/entry1/point_cloud/0"},
+                {"index": 1, "name": "Meadow", "url": "/api/dreame_mower/entry1/point_cloud/1"},
+            ],
+            "active_index": 1,
+            "map_entity_id": "select.shaun_map",
+        }
+
+    @pytest.mark.parametrize("entity_id", ["lawn_mower.other", "lawn_mower.missing"])
+    async def test_other_entities_are_refused(self, ws, entity_id):
+        await ws.send_json({"id": 1, "type": "dreame_mower/point_clouds", "entity_id": entity_id})
+        msg = await ws.receive_json()
+        assert not msg["success"]
+        assert msg["error"]["code"] == "not_found"
