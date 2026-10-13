@@ -12,6 +12,7 @@ from datetime import timedelta
 import logging
 import os
 
+from homeassistant.components import websocket_api
 from homeassistant.components.frontend import add_extra_js_url
 from homeassistant.components.http.server import StaticPathConfig
 from homeassistant.config_entries import ConfigEntry
@@ -44,6 +45,7 @@ from .point_cloud import (
     FRONTEND_URL,
     DreameMowerPointCloudView,
     PointCloudStore,
+    ws_point_clouds,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -83,6 +85,7 @@ async def _async_supports_video(
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Serve the 3D map card and the point clouds it shows."""
+    websocket_api.async_register_command(hass, ws_point_clouds)
     if hass.http is not None:
         hass.http.register_view(DreameMowerPointCloudView())
         frontend_dir = os.path.join(os.path.dirname(__file__), "frontend")

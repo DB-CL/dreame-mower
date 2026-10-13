@@ -1,7 +1,7 @@
 """Serve the mower's 3D maps (point clouds) to the 3D map card.
 
-The card reads each map's endpoint from the map camera's ``point_cloud_maps``
-attribute and fetches it with the user's credentials. A cloud is downloaded
+The card asks ``dreame_mower/point_clouds`` for the maps of its mower, then
+fetches each map's cloud from an authenticated endpoint. A cloud is downloaded
 once and kept on disk under its cloud file name, so it is only fetched again
 when the mower stores a new one.
 """
@@ -14,13 +14,19 @@ import os
 import threading
 import time
 from http import HTTPStatus
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from aiohttp import web
+import voluptuous as vol
 
+from homeassistant.components.websocket_api.connection import ActiveConnection
+from homeassistant.components.websocket_api.const import ERR_NOT_FOUND
+from homeassistant.components.websocket_api.decorators import websocket_command
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.http import KEY_HASS, HomeAssistantView
 
-from .const import DATA_POINT_CLOUD, DOMAIN
+from .const import DATA_COORDINATOR, DATA_POINT_CLOUD, DOMAIN
 
 if TYPE_CHECKING:
     from .dreame.device import DreameMowerDevice
@@ -105,3 +111,41 @@ class DreameMowerPointCloudView(HomeAssistantView):
         if request.headers.get("If-None-Match") == etag:
             return web.Response(status=HTTPStatus.NOT_MODIFIED, headers=headers)
         return web.Response(body=data, content_type="application/octet-stream", headers=headers)
+
+
+@websocket_command(
+    {vol.Required("type"): "dreame_mower/point_clouds", vol.Required("entity_id"): str}
+)
+@callback
+def ws_point_clouds(
+    hass: HomeAssistant, connection: ActiveConnection, msg: dict[str, Any]
+) -> None:
+    """List the maps of a mower with their 3D map endpoints, and the active map.
+
+    Also names the mower's map select, whose state the card watches to follow
+    a switch of the active map.
+    """
+    registry = er.async_get(hass)
+    entry = registry.async_get(msg["entity_id"])
+    entry_id = entry.config_entry_id if entry is not None and entry.platform == DOMAIN else None
+    data = hass.data.get(DOMAIN, {}).get(entry_id) if entry_id else None
+    if entry_id is None or not data or DATA_POINT_CLOUD not in data:
+        connection.send_error(msg["id"], ERR_NOT_FOUND, "Not a Dreame mower")
+        return
+    coordinator = data[DATA_COORDINATOR]
+    device = coordinator.device
+    maps = [m for m in device.available_maps if isinstance(m.get("index"), int)]
+    current = device.current_map_id
+    connection.send_result(
+        msg["id"],
+        {
+            "maps": [
+                {"index": m["index"], "name": m["name"], "url": point_cloud_url(entry_id, m["index"])}
+                for m in maps
+            ],
+            "active_index": next((m["index"] for m in maps if m["id"] == current), None),
+            "map_entity_id": registry.async_get_entity_id(
+                "select", DOMAIN, f"{coordinator.device_mac or 'unknown'}_map_select"
+            ),
+        },
+    )

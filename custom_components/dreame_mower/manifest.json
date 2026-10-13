@@ -3,7 +3,8 @@
   "name": "Dreame Mower",
   "after_dependencies": [
     "frontend",
-    "http"
+    "http",
+    "websocket_api"
   ],
   "codeowners": [
     "@antondaubert"

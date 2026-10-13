@@ -1,19 +1,22 @@
 /*
  * Dreame Mower 3D map card.
  *
- * Shows the LiDAR point cloud the mower recorded for a map, read through the
- * integration's authenticated endpoint. The map camera lists the maps and their
- * endpoints in its `point_cloud_maps` attribute, and the card follows the active
- * map unless another one is picked.
+ * Shows the LiDAR point cloud the mower recorded for a map. The card asks the
+ * integration for the mower's maps (WebSocket `dreame_mower/point_clouds`),
+ * fetches the clouds from its authenticated endpoint, and follows the active
+ * map through the mower's map select unless another map is picked.
  *
  *   type: custom:dreame-mower-3d-card
- *   entity: camera.my_mower_map
+ *   entity: lawn_mower.my_mower
  *   height: 450px        # optional, when the dashboard does not size the card
  *   point_size: 0.25     # optional, in metres
  *   invert_pitch: false  # optional, default of the "Invert ↑↓" box
+ *
+ * The integration serves this file and loads it with every dashboard; three.js
+ * is only loaded once a card is shown.
  */
 
-const THREE_URL = new URL("./three.module.min.js", import.meta.url).href;
+const THREE_URL = new URL("./three-0.160.0.module.min.js", import.meta.url).href;
 let threePromise = null;
 const loadThree = () => (threePromise ??= import(THREE_URL));
 
@@ -349,19 +352,60 @@ const STYLE = `
   .help b { font-weight: 600; white-space: nowrap; }
 `;
 
+const CARD_TYPE = "dreame-mower-3d-card";
+const DOMAIN = "dreame_mower";
+
+const isDreameMower = (hass, entityId) =>
+  typeof entityId === "string" && entityId.startsWith("lawn_mower.") && hass.entities?.[entityId]?.platform === DOMAIN;
+
+const FORM_LABELS = {
+  entity: "Mower",
+  height: "Height",
+  point_size: "Point size (m)",
+  invert_pitch: "Invert the ↑ ↓ keys",
+};
+const FORM_HELPERS = {
+  height: "Any CSS height, such as 450px or 70vh; ignored where the dashboard sizes the card",
+  invert_pitch: "Default for this card; each browser can still change it with the Invert ↑↓ box",
+};
+
 class DreameMower3dCard extends HTMLElement {
+  static getConfigForm() {
+    return {
+      schema: [
+        { name: "entity", required: true, selector: { entity: { filter: { domain: "lawn_mower", integration: DOMAIN } } } },
+        {
+          type: "grid",
+          name: "",
+          schema: [
+            { name: "height", selector: { text: {} } },
+            { name: "point_size", selector: { number: { min: 0.05, max: 2, step: 0.05, mode: "box" } } },
+          ],
+        },
+        { name: "invert_pitch", selector: { boolean: {} } },
+      ],
+      computeLabel: (schema) => FORM_LABELS[schema.name],
+      computeHelper: (schema) => FORM_HELPERS[schema.name],
+    };
+  }
+
   static getStubConfig(hass) {
-    const camera = Object.keys(hass.states).find((id) => id.startsWith("camera.") && hass.states[id].attributes.point_cloud_maps);
-    return { entity: camera || "" };
+    return { entity: Object.keys(hass.states).find((id) => isDreameMower(hass, id)) || "" };
+  }
+
+  static getEntitySuggestion(hass, entityId) {
+    return isDreameMower(hass, entityId) ? { config: { type: `custom:${CARD_TYPE}`, entity: entityId } } : null;
   }
 
   setConfig(config) {
-    if (!config || !config.entity) throw new Error("Set `entity` to the mower's map camera");
+    if (!config || !config.entity) throw new Error("Choose a Dreame mower");
+    if (config.entity !== this._config?.entity) { this._info = null; this._watchState = undefined; }
     this._config = config;
     let stored = null;
     try { stored = localStorage.getItem(STORAGE_INVERT); } catch (e) { /* storage may be blocked */ }
     this._invertPitch = stored === null ? !!config.invert_pitch : stored === "1";
     if (this.shadowRoot) this._applyConfig();
+    if (this._viewer) this._viewer.options.pointSize = Number(config.point_size) || 0.25;
   }
 
   set hass(hass) {
@@ -443,21 +487,42 @@ class DreameMower3dCard extends HTMLElement {
     }
   }
 
-  _maps() {
-    const state = this._hass?.states[this._config?.entity];
-    if (!state) return { maps: [], active: null, missing: true };
-    return { maps: state.attributes.point_cloud_maps || [], active: state.attributes.point_cloud_active_index ?? null };
+  /** Ask the integration for the maps again whenever the mower's active map changes. */
+  _sync() {
+    if (!this.shadowRoot || !this._hass || !this._config) return;
+    if (!this._hass.states[this._config.entity]) return this._setStatus(`Entity not found: ${this._config.entity}`);
+    const watched = this._info?.map_entity_id;
+    const state = watched ? this._hass.states[watched]?.state : null;
+    if (!this._info || state !== this._watchState) {
+      this._watchState = state;
+      this._fetchMaps();
+      return;
+    }
+    this._showWanted();
   }
 
-  /** Follow the active map unless one was picked, and redraw the map buttons. */
-  _sync() {
-    if (!this.shadowRoot || !this._hass) return;
-    const { maps, active, missing } = this._maps();
-    if (missing) return this._setStatus(`Entity not found: ${this._config.entity}`);
-    if (!maps.length) return this._setStatus("This entity lists no 3D maps");
-    if (active !== this._lastActive) { this._lastActive = active; this._picked = null; }
-    const wanted = maps.find((m) => m.index === this._picked) || maps.find((m) => m.index === active) || maps[0];
+  async _fetchMaps() {
+    if (this._fetching) { this._refetch = true; return; }
+    this._fetching = true;
+    try {
+      const info = await this._hass.callWS({ type: "dreame_mower/point_clouds", entity_id: this._config.entity });
+      if (info.active_index !== this._info?.active_index) this._picked = null;
+      this._info = info;
+      if (info.map_entity_id) this._watchState = this._hass.states[info.map_entity_id]?.state ?? null;
+      this._showWanted();
+    } catch (err) {
+      this._setStatus(`Could not list the 3D maps: ${err.message || err.code || err}`);
+    } finally {
+      this._fetching = false;
+      if (this._refetch) { this._refetch = false; this._fetchMaps(); }
+    }
+  }
 
+  /** Show the picked map, else the active one, and redraw the map buttons. */
+  _showWanted() {
+    const maps = this._info?.maps || [];
+    if (!maps.length) return this._setStatus("The mower has no maps yet");
+    const wanted = maps.find((m) => m.index === this._picked) || maps.find((m) => m.index === this._info.active_index) || maps[0];
     const key = maps.map((m) => `${m.index}:${m.name}`).join("|") + `#${wanted.index}`;
     if (key !== this._barKey) {
       this._barKey = key;
@@ -465,7 +530,7 @@ class DreameMower3dCard extends HTMLElement {
         const b = document.createElement("button");
         b.textContent = m.name;
         b.classList.toggle("on", m.index === wanted.index);
-        b.onclick = () => { this._picked = m.index; this._sync(); };
+        b.onclick = () => { this._picked = m.index; this._showWanted(); };
         return b;
       }) : []));
     }
@@ -498,12 +563,13 @@ class DreameMower3dCard extends HTMLElement {
   }
 }
 
-if (!customElements.get("dreame-mower-3d-card")) {
-  customElements.define("dreame-mower-3d-card", DreameMower3dCard);
+if (!customElements.get(CARD_TYPE)) {
+  customElements.define(CARD_TYPE, DreameMower3dCard);
   window.customCards = window.customCards || [];
   window.customCards.push({
-    type: "dreame-mower-3d-card",
+    type: CARD_TYPE,
     name: "Dreame Mower 3D map",
     description: "The LiDAR point cloud of the mower's map, to orbit and fly through.",
+    preview: false,
   });
 }
