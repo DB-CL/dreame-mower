@@ -10,17 +10,22 @@ from __future__ import annotations
 
 from datetime import timedelta
 import logging
+import os
 
+from homeassistant.components.frontend import add_extra_js_url
+from homeassistant.components.http.server import StaticPathConfig
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import EVENT_HOMEASSISTANT_STOP, Platform
 from homeassistant.core import Event, HomeAssistant
 from homeassistant.exceptions import ConfigEntryNotReady
-from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers import config_validation as cv, entity_registry as er
 from homeassistant.helpers.event import async_track_time_interval
+from homeassistant.helpers.typing import ConfigType
 
 from .const import (
     DATA_COORDINATOR,
     DATA_PLATFORMS,
+    DATA_POINT_CLOUD,
     DATA_VIDEO_RUNTIME,
     DATA_VIDEO_SUPPORTED,
     DOMAIN,
@@ -34,8 +39,16 @@ from .coordinator import DreameMowerCoordinator
 from .dreame.cloud.cloud_video import DreameMowerCloudVideo
 from .dreame.video_runtime import find_runtime
 from .config_flow import DEVICE_TYPE_SWBOT
+from .point_cloud import (
+    CARD_FILE,
+    FRONTEND_URL,
+    DreameMowerPointCloudView,
+    PointCloudStore,
+)
 
 _LOGGER = logging.getLogger(__name__)
+
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
 _MOWER_PLATFORMS = (
     Platform.LAWN_MOWER,
@@ -66,6 +79,23 @@ async def _async_supports_video(
     except Exception as err:  # noqa: BLE001 - never block setup over video
         _LOGGER.debug("Could not check whether video is available: %s", err)
         return None
+
+
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
+    """Serve the 3D map card and the point clouds it shows."""
+    if hass.http is not None:
+        hass.http.register_view(DreameMowerPointCloudView())
+        frontend_dir = os.path.join(os.path.dirname(__file__), "frontend")
+        await hass.http.async_register_static_paths(
+            [StaticPathConfig(FRONTEND_URL, frontend_dir, True)]
+        )
+        if "frontend" in hass.config.components:
+            # The file's date in the URL makes browsers drop a cached older card.
+            card_mtime = await hass.async_add_executor_job(
+                os.path.getmtime, os.path.join(frontend_dir, CARD_FILE)
+            )
+            add_extra_js_url(hass, f"{FRONTEND_URL}/{CARD_FILE}?v={int(card_mtime)}")
+    return True
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -160,6 +190,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         DATA_VIDEO_RUNTIME: video_runtime,
         DATA_VIDEO_SUPPORTED: video_supported,
     }
+    if coordinator.device_type != DEVICE_TYPE_SWBOT:
+        hass.data[DOMAIN][entry.entry_id][DATA_POINT_CLOUD] = PointCloudStore(
+            coordinator.device, hass.config.path(DOMAIN, "point_cloud", entry.entry_id)
+        )
 
     # Home Assistant does not unload config entries when it stops, so the MQTT
     # client would keep handing pushes from a working mower to an event loop
