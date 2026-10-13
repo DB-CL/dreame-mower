@@ -563,7 +563,12 @@ class DreameMower3dCard extends HTMLElement {
   }
 }
 
-if (!customElements.get(CARD_TYPE)) {
+// The integration loads this file before the frontend has set up its own custom
+// element registry, which replaces window.customElements: a card defined in the
+// first one is unknown to dashboards. Define it once the frontend's root element
+// exists, which happens after the registry is in place.
+function defineCard() {
+  if (customElements.get(CARD_TYPE)) return;
   customElements.define(CARD_TYPE, DreameMower3dCard);
   window.customCards = window.customCards || [];
   window.customCards.push({
@@ -573,3 +578,4 @@ if (!customElements.get(CARD_TYPE)) {
     preview: false,
   });
 }
+customElements.whenDefined("home-assistant").then(defineCard);
